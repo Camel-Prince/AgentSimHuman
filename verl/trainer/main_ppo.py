@@ -172,9 +172,9 @@ class RewardManager():
 
         ratio = output_len / gt_len
         if ratio < 0.80:
-            return -0.20 * min((0.80 - ratio) / 0.80, 1.0)
+            return -0.50 * min((0.80 - ratio) / 0.80, 1.0)
         if ratio > 1.25:
-            return -0.15 * min((ratio - 1.25) / 1.25, 1.0)
+            return -0.35 * min((ratio - 1.25) / 1.25, 1.0)
         return 0.0
 
     def _paper_writing_length_penalties(self, data: DataProto, sample_idx: int):
@@ -453,7 +453,7 @@ class RewardManager():
             camera_score = float(scores[i]) + camera_penalty
 
             # --- Per-draft penalties ---
-            format_weights = [0.15, 0.10, 0.05]
+            format_weights = [0.30, 0.20, 0.10]
             draft_len_weights = [0.50, 0.35, 0.25]
             per_draft_penalties = []
             total_format_penalty = 0.0
