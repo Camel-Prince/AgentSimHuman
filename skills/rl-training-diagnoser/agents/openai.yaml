@@ -1,0 +1,6 @@
+interface:
+  display_name: "RL Training Diagnoser"
+  short_description: "Analyze unstable PPO/GRPO training metrics."
+  default_prompt: "Use $rl-training-diagnoser to analyze this RL training run from logged metrics and configs, then explain whether training is healthy and what to change."
+policy:
+  allow_implicit_invocation: true

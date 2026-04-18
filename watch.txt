@@ -1,0 +1,15 @@
+训练过程中：                                                                                                          
+                                                                                                                        
+  # 快速检查进度                                                                                                        
+  bash scripts/check_training_progress.sh                                                                               
+                                                                                                                        
+  # 或者实时监控 log                                                                                                    
+  tail -f paper-writing-grpo-qwen2_5-7b-instruct-debug.log | grep -E "reward|loss"                                      
+                                                                                                                        
+  训练结束后：                                                                                                          
+                                                                                                                        
+  # 详细分析 log                                                                                                        
+  python scripts/analyze_training_log.py paper-writing-grpo-qwen2_5-7b-instruct-debug.log                               
+                                                                                                                        
+  # 查看所有 checkpoint                                                                                                 
+  ls -lh verl_checkpoints/paper-writing-grpo-qwen2_5-7b-instruct-debug/

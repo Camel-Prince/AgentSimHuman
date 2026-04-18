@@ -1,0 +1,926 @@
+import torch
+import re
+from collections import defaultdict
+import os
+from typing import List, Dict, Any, Tuple
+from dataclasses import dataclass
+from .tensor_helper import TensorHelper, TensorConfig
+from verl import DataProto
+from verl.utils.tracking import Tracking
+import shutil
+import requests
+import asyncio
+import pdb
+
+@dataclass
+class GenerationConfig:
+    max_turns: int
+    max_start_length: int
+    max_prompt_length: int
+    max_response_length: int
+    max_obs_length: int
+    num_gpus: int
+    no_think_rl: bool=False
+    search_url: str = None
+    topk: int = 3
+    # Paper writing specific configs
+    num_revision_rounds: int = 3
+    commenter_api_key: str = None
+    commenter_base_url: str = None
+    commenter_model: str = "qwen-plus"
+
+class LLMGenerationManager:
+    def __init__(
+        self,
+        tokenizer,
+        actor_rollout_wg,
+        config: GenerationConfig,
+        is_validation: bool = False,
+    ):
+        self.tokenizer = tokenizer
+        self.actor_rollout_wg = actor_rollout_wg
+        self.config = config
+        self.is_validation = is_validation
+
+        self.tensor_fn = TensorHelper(TensorConfig(
+            pad_token_id=tokenizer.pad_token_id,
+            max_prompt_length=config.max_prompt_length,
+            max_obs_length=config.max_obs_length,
+            max_start_length=config.max_start_length
+        ))
+
+    def _batch_tokenize(self, responses: List[str]) -> torch.Tensor:
+        """Tokenize a batch of responses."""
+        return self.tokenizer(
+            responses, 
+            add_special_tokens=False, 
+            return_tensors='pt', 
+            padding="longest"
+        )['input_ids']
+
+    def _postprocess_responses(self, responses: torch.Tensor) -> torch.Tensor:
+        """postprocess to tokenize."""
+        responses_str = self.tokenizer.batch_decode(
+            responses,
+            skip_special_tokens=True
+        )
+
+        # Truncate at the first closing tag found
+        processed_responses = []
+        for resp in responses_str:
+            if '</search>' in resp:
+                processed_responses.append(resp.split('</search>')[0] + '</search>')
+            elif '</answer>' in resp:
+                processed_responses.append(resp.split('</answer>')[0] + '</answer>')
+            else:
+                processed_responses.append(resp)
+
+        responses_str = processed_responses
+
+        if self.config.no_think_rl:
+            raise ValueError('stop')
+            # if no_think_rl is enabled, only keep action in the str
+            actions, _ = self.env.postprocess_predictions(responses_str)
+            responses_str=[f"<answer>{envs[idx].ACTION_LOOKUP[action]}</answer>" for idx, action in enumerate(actions)]
+            print("RESPONSES:", responses_str)
+        responses = self._batch_tokenize(responses_str)
+        return responses, responses_str
+
+    def _process_next_obs(self, next_obs: List[str]) -> torch.Tensor:
+        """Process next observations from environment, into token ids, avoid truncation."""
+        
+        next_obs_ids = self.tokenizer(
+            next_obs, 
+            padding='longest',
+            return_tensors='pt',
+            add_special_tokens=False,  # Prevents adding special tokens
+        )['input_ids']
+
+        if next_obs_ids.shape[1] > self.config.max_obs_length:
+            print(f"[WARNING] OBSERVATION TOO LONG, CONSIDER CHANGING YOUR CONFIG, {next_obs_ids.shape[1]} & {self.config.max_obs_length}")            
+            next_obs_ids = next_obs_ids[:, :self.config.max_obs_length]
+
+        return next_obs_ids
+
+    def _update_rolling_state(self, rollings: DataProto, cur_responses: torch.Tensor, 
+                            next_obs_ids: torch.Tensor) -> Dict:
+        """Update rolling state with new responses and observations."""
+        # Concatenate and handle padding        
+        new_input_ids = self.tensor_fn.concatenate_with_padding([
+            rollings.batch['input_ids'],
+            cur_responses,
+            next_obs_ids
+        ])
+        
+        # Create attention mask and position ids
+        new_attention_mask = self.tensor_fn.create_attention_mask(new_input_ids)
+        new_position_ids = self.tensor_fn.create_position_ids(new_attention_mask)
+
+        # Cut to appropriate length
+        effective_len = new_attention_mask.sum(dim=1).max()
+        max_len = min(self.config.max_prompt_length, effective_len)
+
+        new_rollings = DataProto.from_dict({
+            'input_ids': new_input_ids[:, -max_len:],
+            'position_ids': new_position_ids[:, -max_len:],
+            'attention_mask': new_attention_mask[:, -max_len:]
+        })
+        new_rollings.meta_info.update(rollings.meta_info)
+        
+        return new_rollings
+
+    def _rebuild_rolling_state(self, query_ids: torch.Tensor, draft_ids: torch.Tensor,
+                              comment_obs_ids: torch.Tensor, meta_info: Dict = None) -> DataProto:
+        """
+        Rebuild rolling state from scratch (non-accumulative).
+        Used in paper writing to keep only the latest draft and comment.
+
+        Args:
+            query_ids: Initial query tokens
+            draft_ids: Current draft tokens
+            comment_obs_ids: Current comment tokens
+            meta_info: Optional meta_info to preserve
+
+        Returns:
+            DataProto with input_ids, attention_mask, position_ids
+        """
+        # Concatenate and handle padding
+        new_input_ids = self.tensor_fn.concatenate_with_padding([
+            query_ids,
+            draft_ids,
+            comment_obs_ids
+        ])
+
+        # Create attention mask and position ids
+        new_attention_mask = self.tensor_fn.create_attention_mask(new_input_ids)
+        new_position_ids = self.tensor_fn.create_position_ids(new_attention_mask)
+
+        # Cut to appropriate length
+        effective_len = new_attention_mask.sum(dim=1).max()
+        max_len = min(self.config.max_prompt_length, effective_len)
+
+        new_rollings = DataProto.from_dict({
+            'input_ids': new_input_ids[:, -max_len:],
+            'position_ids': new_position_ids[:, -max_len:],
+            'attention_mask': new_attention_mask[:, -max_len:]
+        })
+
+        # Preserve meta_info if provided
+        if meta_info is not None:
+            new_rollings.meta_info.update(meta_info)
+
+        return new_rollings
+
+    def _info_masked_concatenate_with_padding(self, 
+                prompt: torch.Tensor, 
+                prompt_with_mask: torch.Tensor, 
+                response: torch.Tensor, 
+                info: torch.Tensor = None,
+                pad_to_left: bool = True
+            ) -> torch.Tensor:
+        """Concatenate tensors and handle padding. Additionally, create a mask (info_mask) to cover the information block if it exists."""
+        pad_id = self.tokenizer.pad_token_id
+        tensors = [prompt, response]
+        tensors_with_mask = [prompt_with_mask, response]
+        if info is not None:
+            tensors.append(info)
+            info_mask = torch.full(info.size(), pad_id, dtype=info.dtype, device=info.device) # information mask
+            tensors_with_mask.append(info_mask)
+        
+        concatenated = torch.cat(tensors, dim=1)
+        concatenated_with_info = torch.cat(tensors_with_mask, dim=1)
+        mask = concatenated != pad_id if pad_to_left else concatenated == pad_id
+        sorted_indices = mask.to(torch.int64).argsort(dim=1, stable=True)
+        padded_tensor = concatenated.gather(1, sorted_indices)
+        padded_tensor_with_info = concatenated_with_info.gather(1, sorted_indices)
+
+        return padded_tensor, padded_tensor_with_info
+
+    def _update_right_side(self, right_side: Dict, 
+                          cur_responses: torch.Tensor,
+                          next_obs_ids: torch.Tensor = None) -> Dict:
+        """Update right side state."""
+        if next_obs_ids != None:
+            responses, responses_with_info_mask = self._info_masked_concatenate_with_padding(
+                    right_side['responses'],
+                    right_side['responses_with_info_mask'],
+                    cur_responses,
+                    next_obs_ids, 
+                    pad_to_left=False
+                )
+        else:
+            responses, responses_with_info_mask = self._info_masked_concatenate_with_padding(
+                    right_side['responses'],
+                    right_side['responses_with_info_mask'],
+                    cur_responses,
+                    pad_to_left=False
+                )
+        effective_len = self.tensor_fn.create_attention_mask(responses).sum(dim=1).max()
+        max_len = min(self.config.max_prompt_length, effective_len)
+        
+        return {'responses': responses[:, :max_len], 'responses_with_info_mask': responses_with_info_mask[:, :max_len]}
+
+    def _generate_with_gpu_padding(self, active_batch: DataProto) -> DataProto:
+        """
+            Wrapper for generation that handles multi-GPU padding requirements.
+            if num_gpus <= 1, return self.actor_rollout_wg.generate_sequences(active_batch)
+            if active_batch size is not divisible by num_gpus, pad with first sequence
+            then remove padding from output
+        """
+        num_gpus = self.config.num_gpus
+        if num_gpus <= 1:
+            return self.actor_rollout_wg.generate_sequences(active_batch)
+            
+        batch_size = active_batch.batch['input_ids'].shape[0]
+        remainder = batch_size % num_gpus
+        
+        for key in active_batch.batch.keys():
+            active_batch.batch[key] = active_batch.batch[key].long()
+        if remainder == 0:
+            return self.actor_rollout_wg.generate_sequences(active_batch)
+        
+        # Add padding sequences
+        padding_size = num_gpus - remainder
+        padded_batch = {}
+        
+        for k, v in active_batch.batch.items():
+            # Use first sequence as padding template
+            pad_sequence = v[0:1].repeat(padding_size, *[1] * (len(v.shape) - 1))
+            padded_batch[k] = torch.cat([v, pad_sequence], dim=0)
+
+        padded_active_batch = DataProto.from_dict(padded_batch)
+        for key in padded_active_batch.batch.keys():
+            padded_active_batch.batch[key] = padded_active_batch.batch[key].long()
+
+        # Generate with padded batch
+        padded_output = self.actor_rollout_wg.generate_sequences(padded_active_batch)
+
+        # Remove padding from output
+        trimmed_batch = {k: v[:-padding_size] for k, v in padded_output.batch.items()}
+        
+        # Handle meta_info if present
+        if hasattr(padded_output, 'meta_info') and padded_output.meta_info:
+            trimmed_meta = {}
+            for k, v in padded_output.meta_info.items():
+                if isinstance(v, torch.Tensor):
+                    trimmed_meta[k] = v[:-padding_size]
+                else:
+                    trimmed_meta[k] = v
+            padded_output.meta_info = trimmed_meta
+            
+        padded_output.batch = trimmed_batch
+        return padded_output
+
+    def run_llm_loop(self, gen_batch, initial_input_ids: torch.Tensor) -> Tuple[Dict, Dict]:
+        """Run main LLM generation loop.
+        - 样本 0：问题 "Who invented the telephone?"                                                    
+        - 样本 1：问题 "What is the capital of France?" 
+        """
+        
+        original_left_side = {'input_ids': initial_input_ids[:, -self.config.max_start_length:]}
+        original_right_side = {'responses': initial_input_ids[:, []], 'responses_with_info_mask': initial_input_ids[:, []]}
+        
+        active_mask = torch.ones(gen_batch.batch['input_ids'].shape[0], dtype=torch.bool) # 标记哪些样本还在生成，即没有生成<answer>也没有达到最大_turns
+        turns_stats = torch.ones(gen_batch.batch['input_ids'].shape[0], dtype=torch.int) # 记录每个样本当前的turn数
+        valid_action_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int) # 记录每个样本当前的valid_action数
+        valid_search_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int) # 记录每个样本当前的valid_search数
+        active_num_list = [active_mask.sum().item()]
+        rollings = gen_batch # 滚动上下文，每个turn都会追加新的内容，作为下一轮的输入
+
+        # Main generation loop
+        for step in range(self.config.max_turns):
+            if not active_mask.sum():
+                break
+            rollings.batch = self.tensor_fn.cut_to_effective_len(
+                rollings.batch,
+                keys=['input_ids', 'attention_mask', 'position_ids']
+            ) # 剪掉左侧所有样本的共同padding部分，节省显存
+            
+            # gen_output = self.actor_rollout_wg.generate_sequences(rollings)
+            """
+             rolings.batch:
+             4: batch_size
+             143: max_prompt_length after cutting to effective_len
+             TensorDict(
+                fields={
+                    attention_mask: Tensor(shape=torch.Size([4, 143]), device=cpu, dtype=torch.int64, is_shared=False),
+                    input_ids: Tensor(shape=torch.Size([4, 143]), device=cpu, dtype=torch.int64, is_shared=False),
+                    position_ids: Tensor(shape=torch.Size([4, 143]), device=cpu, dtype=torch.int64, is_shared=False)},
+                batch_size=torch.Size([4]),
+                device=None,
+                is_shared=False)
+            """
+            rollings_active = DataProto.from_dict({
+                k: v[active_mask] for k, v in rollings.batch.items()
+            })
+            gen_output = self._generate_with_gpu_padding(rollings_active) # 自己封装的调用VeRL的LLM生成
+            """
+            - 样本 0："<think>Let me search for this.</think><search>telephone inventor</search>"
+            - 样本 1："<think>I know this.</think><answer>Paris</answer>" 
+            """
+            meta_info = gen_output.meta_info            
+            responses_ids, responses_str = self._postprocess_responses(gen_output.batch['responses'])
+            responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
+
+            # 🌟Execute in environment and process observations
+            next_obs, dones, valid_action, is_search = self.execute_predictions(
+                responses_str, self.tokenizer.pad_token, active_mask,
+                do_search = False, #only for debug
+            )
+            """
+            以一个batch-size = 2的为例子，第一个问题调用了外部retriever，第二个问题没有。
+            next_obs      = ['<information>...</information>', '']                                          
+            dones         = [0, 1]                                                                          
+            valid_action  = [1, 1]                                                                          
+            is_search     = [1, 0] 
+            """
+            # 更新active_mask，记录哪些样本还在生成； 更新每个样本当前的turn数，更新每个样本的valid_action数和valid_search数
+            curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
+            active_mask = active_mask * curr_active_mask
+            active_num_list.append(active_mask.sum().item())
+            turns_stats[curr_active_mask] += 1
+            valid_action_stats += torch.tensor(valid_action, dtype=torch.int)
+            valid_search_stats += torch.tensor(is_search, dtype=torch.int)
+            # 处理下一个观察，将文本转换为token_ids； 比如
+            next_obs_ids = self._process_next_obs(next_obs)
+            
+            # Update states
+            rollings = self._update_rolling_state(
+                rollings,
+                responses_ids,
+                next_obs_ids
+            ) # 将作为下一个turn的输入
+            """
+             [原始prompt] + [<think>...</think><search>telephone inventor</search>] +
+                [<information>Doc1...</information>] 
+            """
+            
+            original_right_side = self._update_right_side(
+                original_right_side,
+                responses_ids,
+                next_obs_ids
+            ) # 更新responses和rewponses_with_info_mask, <information>...</information>的内容在responses_with_info_mask中被pad掉，只保留LLM生成的内容
+            
+        # final LLM rollout，,如果还有 active 样本（比如 max_turns 用完了还没给 <answer>），这里会做最后一次生成，但do_search=False，不再调用检索，强制收尾。
+        if active_mask.sum():
+            rollings.batch = self.tensor_fn.cut_to_effective_len(
+                rollings.batch,
+                keys=['input_ids', 'attention_mask', 'position_ids']
+            )
+
+            # gen_output = self.actor_rollout_wg.generate_sequences(rollings)
+            rollings_active = DataProto.from_dict({
+                k: v[active_mask] for k, v in rollings.batch.items()
+            })            
+            gen_output = self._generate_with_gpu_padding(rollings_active)
+
+            meta_info = gen_output.meta_info            
+            responses_ids, responses_str = self._postprocess_responses(gen_output.batch['responses'])
+            responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
+
+            # # Execute in environment and process observations
+            _, dones, valid_action, is_search = self.execute_predictions(
+                responses_str, self.tokenizer.pad_token, active_mask, do_search=False # 超出max_turns的样本，不再调用检索，强制回答得到最后的答案
+            )
+
+            curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
+            active_mask = active_mask * curr_active_mask
+            active_num_list.append(active_mask.sum().item())
+            valid_action_stats += torch.tensor(valid_action, dtype=torch.int)
+            valid_search_stats += torch.tensor(is_search, dtype=torch.int)
+            
+
+            original_right_side = self._update_right_side(
+                original_right_side,
+                responses_ids,
+            )
+        
+        meta_info['turns_stats'] = turns_stats.tolist()
+        meta_info['active_mask'] = active_mask.tolist()
+        meta_info['valid_action_stats'] = valid_action_stats.tolist()
+        meta_info['valid_search_stats'] = valid_search_stats.tolist()
+        
+        print("ACTIVE_TRAJ_NUM:", active_num_list)
+        
+        return self._compose_final_output(original_left_side, original_right_side, meta_info)
+
+    def _compose_final_output(self, left_side: Dict,
+                            right_side: Dict,
+                            meta_info: Dict) -> Tuple[Dict, Dict]:
+        """Compose final generation output."""
+        final_output = right_side.copy()
+        final_output['prompts'] = left_side['input_ids']
+        
+        # Combine input IDs
+        final_output['input_ids'] = torch.cat([
+            left_side['input_ids'],
+            right_side['responses']
+        ], dim=1)
+        
+        # Create attention mask and position ids
+        final_output['attention_mask'] = torch.cat([
+            self.tensor_fn.create_attention_mask(left_side['input_ids']),
+            self.tensor_fn.create_attention_mask(final_output['responses'])
+        ], dim=1)
+        final_output['info_mask'] = torch.cat([
+            self.tensor_fn.create_attention_mask(left_side['input_ids']),
+            self.tensor_fn.create_attention_mask(final_output['responses_with_info_mask'])
+        ], dim=1)
+        
+        final_output['position_ids'] = self.tensor_fn.create_position_ids(
+            final_output['attention_mask']
+        )
+        
+        final_output = DataProto.from_dict(final_output)
+        final_output.meta_info.update(meta_info)
+        
+        return final_output
+
+    def execute_predictions(self, predictions: List[str], pad_token: str, active_mask=None, do_search=True) -> List[str]:
+        """
+        Execute predictions across multiple environments.
+        NOTE: the function is the actual `step` function in the environment
+        NOTE penalty_for_invalid is not included in observation shown to the LLM
+        
+        Args:
+            envs: List of environment instances
+            predictions: List of action predictions
+            pad_token: Token to use for padding
+            
+        Returns:
+            List of observation strings
+        """
+        cur_actions, contents = self.postprocess_predictions(predictions)
+        next_obs, dones, valid_action, is_search = [], [], [], []
+        
+        search_queries = [content for action, content in zip(cur_actions, contents) if action == 'search']
+        if do_search:
+            search_results = self.batch_search(search_queries)
+            assert len(search_results) == sum([1 for action in cur_actions if action == 'search'])
+        else:
+            search_results = [''] * sum([1 for action in cur_actions if action == 'search'])
+
+        for i, (action, active) in enumerate(zip(cur_actions, active_mask)):
+            
+            if not active:
+                next_obs.append('')
+                dones.append(1)
+                valid_action.append(0)
+                is_search.append(0)
+            else:
+                if action == 'answer':
+                    next_obs.append('')
+                    dones.append(1)
+                    valid_action.append(1)
+                    is_search.append(0)
+                elif action == 'search':
+                    next_obs.append(f'\n\n<information>{search_results.pop(0).strip()}</information>\n\n')
+                    dones.append(0)
+                    valid_action.append(1)
+                    is_search.append(1)
+                else:
+                    next_obs.append(f'\nMy previous action is invalid. \
+If I want to search, I should put the query between <search> and </search>. \
+If I want to give the final answer, I should put the answer between <answer> and </answer>. Let me try again.\n')
+                    dones.append(0)
+                    valid_action.append(0)
+                    is_search.append(0)
+            
+        assert len(search_results) == 0
+            
+        return next_obs, dones, valid_action, is_search
+
+    def postprocess_predictions(self, predictions: List[Any]) -> Tuple[List[int], List[bool]]:
+        """
+        Process (text-based) predictions from llm into actions and validity flags.
+        
+        Args:
+            predictions: List of raw predictions
+            
+        Returns:
+            Tuple of (actions list, validity flags list)
+        """
+        actions = []
+        contents = []
+                
+        for prediction in predictions:
+            if isinstance(prediction, str): # for llm output
+                pattern = r'<(search|answer)>(.*?)</\1>'
+                match = re.search(pattern, prediction, re.DOTALL)
+                if match:
+                    content = match.group(2).strip()  # Return only the content inside the tags
+                    action = match.group(1)
+                else:
+                    content = ''
+                    action = None
+            else:
+                raise ValueError(f"Invalid prediction type: {type(prediction)}")
+            
+            actions.append(action)
+            contents.append(content)
+            
+        return actions, contents
+
+    def batch_search(self, queries: List[str] = None) -> str:
+        """
+        Batchified search for queries.
+        Args:
+            queries: queries to call the search engine
+        Returns:
+            search results which is concatenated into a string
+        """
+        results = self._batch_search(queries)['result']
+        
+        return [self._passages2string(result) for result in results]
+
+    def _batch_search(self, queries):
+        
+        payload = {
+            "queries": queries,
+            "topk": self.config.topk,
+            "return_scores": True
+        }
+        
+        return requests.post(self.config.search_url, json=payload).json()
+
+    def _passages2string(self, retrieval_result):
+        format_reference = ''
+        for idx, doc_item in enumerate(retrieval_result):
+            
+            content = doc_item['document']['contents']
+            title = content.split("\n")[0]
+            text = "\n".join(content.split("\n")[1:])
+            format_reference += f"Doc {idx+1}(Title: {title}) {text}\n"
+
+        return format_reference
+
+
+    # ========== Paper Writing Specific Methods ==========
+    def run_llm_loop_paper_writing(self, gen_batch, initial_input_ids: torch.Tensor,
+                                   num_revision_rounds: int = None):
+        """
+        Run multi-turn paper writing loop with fixed revision rounds.
+        
+        Flow:
+        1. Generate initial draft -> get comment from Commenter API
+        2. Repeat K times: generate revised draft -> get comment  
+        3. Generate final camera-ready version
+        
+        Args:
+            gen_batch: DataProto with input_ids, attention_mask, position_ids
+            initial_input_ids: Initial prompt tokens
+            num_revision_rounds: Number of draft-comment cycles (default: use config)
+        
+        Returns:
+            final_output: DataProto with complete generation
+            
+         ---             
+        最终输出                                                                                                                   
+                        
+        调用 _compose_final_output 组合最终结果：
+                                                                                                                                    
+        final_output = {
+            'prompts': query,                                                                                                      
+            'responses': draft_0 + comment_0 + draft_1 + comment_1 + draft_2 + comment_2 + camera_ready,
+            'responses_with_info_mask': draft_0 + [pad_mask] + draft_1 + [pad_mask] + draft_2 + [pad_mask] + camera_ready,         
+            'input_ids': query + responses,                                                                                        
+            'attention_mask': [1, 1, 1, ...],  # 基于 input_ids                                                                    
+            'info_mask': [1, 1, 1, 0, 0, 1, 1, 0, 0, ...],  # 基于 responses_with_info_mask，comments 位置为 0                     
+            'position_ids': [0, 1, 2, 3, ...],                                                                                     
+            'meta_info': {                                                                                                         
+                'num_revision_rounds': 3,                                                                                          
+                'camera_ready_texts': [camera_ready 的文本内容]                                                                    
+            }                                                                                                                      
+        }                                                                                                                          
+                                                                                                                                    
+        ---             
+        关键点总结                                                                                                                 
+                                                                                                                                    
+        1. rollings（滚动上下文）：
+            - 非累积，每轮只保留：query + 最新的 draft + 最新的 comment                                                              
+            - 用于下一轮 gen-agent 的输入                                                                                            
+        2. original_right_side（最终输出）：                                                                                       
+            - 累积所有 drafts 和 comments                                                                                            
+            - responses：完整的生成序列                                                                                              
+            - responses_with_info_mask：comments 被替换为 pad_mask                                                                   
+        3. mask 机制：                                                                                                             
+            - gen-agent 生成的内容（drafts, camera-ready）：不加 mask                                                                
+            - commenter 生成的内容（comments）：加 mask（替换为 pad_id）                                                             
+            - 用于训练时只对 gen-agent 的输出计算梯度                                                                                
+        4. 输入逻辑：                                                                                                              
+            - 第 0 轮生成 draft_0：输入 = query                                                                                      
+            - 第 1 轮生成 draft_1：输入 = query + draft_0 + comment_0                                                                
+            - 第 2 轮生成 draft_2：输入 = query + draft_1 + comment_1                                                                
+            - 第 i 轮生成 draft_i：输入 = query + draft_{i-1} + comment_{i-1}                                                        
+            - 最终生成 camera-ready：输入 = query + draft_{最后一轮} + comment_{最后一轮}  
+            
+        next-step:
+        自己决定多少个turn； 
+        适当扩充上下文范围；
+        版本问题，不支持qwen3，用2.5训就够啦
+        
+        data方面：
+        auto-rubric,检查数据是否都是写作任务的？ 
+        """
+        
+        
+        if num_revision_rounds is None:
+            num_revision_rounds = self.config.num_revision_rounds
+        
+        print(f"\n[Paper Writing] Starting {num_revision_rounds}-round revision process")
+        
+        # Initialize
+        original_left_side = {'input_ids': initial_input_ids[:, -self.config.max_start_length:]}
+        original_right_side = {
+            'responses': initial_input_ids[:, []], 
+            'responses_with_info_mask': initial_input_ids[:, []]
+        }
+        rollings = gen_batch
+        
+        # Extract queries from non_tensor_batch; system prompt 和 query应该分离；手动控制循环轮次的时候，gen的system-prompt无需说明循环过程，只需告诉它如果有前轮的drfat和comment，就据此修改，如果没有就重新写draft；
+        queries = self._extract_queries_from_batch(gen_batch)
+        
+        # Extract domain and topic for Commenter API
+        domains, topics = self._extract_domain_topic_from_batch(gen_batch)
+        
+        # Extract optional ground truth references for commenter.
+        # Ground truth is only a reference, not necessarily better than current draft.
+        ground_truths = self._extract_ground_truth_from_batch(gen_batch)
+        
+        # ===== Phase 1: K rounds of draft-comment cycles =====
+        for round_idx in range(num_revision_rounds):
+            print(f"\n[Paper Writing] Round {round_idx + 1}/{num_revision_rounds}")
+            
+            # Cut to effective length
+            rollings.batch = self.tensor_fn.cut_to_effective_len(
+                rollings.batch,
+                keys=['input_ids', 'attention_mask', 'position_ids']
+            )
+            # Debug: print current rolling context, the input of gen-agent each turn
+            gen_input_str = self.tokenizer.batch_decode(rollings.batch["input_ids"], skip_special_tokens=True)
+            # print(f'round_idx: {round_idx}, gen_input_str[0]: {gen_input_str[0]}')
+            
+            # Generate draft
+            gen_output = self._generate_with_gpu_padding(rollings)
+    
+            draft_ids = gen_output.batch["responses"]
+            draft_str = self.tokenizer.batch_decode(draft_ids, skip_special_tokens=True)
+            # print(f'round_idx: {round_idx}, draft_str[0]: {draft_str[0]}') 
+            
+            # Extract <draft> content with fallback
+            # drafts, failed_indices = self._extract_drafts_with_fallback(draft_str, round_idx)
+            # print(f'round_idx: {round_idx}, extracted_drafts[0]: {drafts[0]}')
+
+            # Call Commenter API (async batch) - use domain/topic and optional ground truth reference
+            comments = asyncio.run(self._call_commenter_batch_async(domains, topics, draft_str, ground_truths))
+            # print(f'round_idx: {round_idx}, comments[0]: {comments[0]}')
+            
+            # Format comments as observations
+            comment_obs = [f'\n\n<comment>{c}</comment>\n\n' for c in comments]
+            comment_obs_ids = self._process_next_obs(comment_obs)
+
+            # Rebuild rolling context (non-accumulative: only keep latest draft + comment)
+            rollings = self._rebuild_rolling_state(
+                original_left_side['input_ids'],
+                draft_ids,
+                comment_obs_ids,
+                rollings.meta_info
+            )
+
+            # Update right_side (accumulative: for final output and mask)
+            original_right_side = self._update_right_side(
+                original_right_side, draft_ids, comment_obs_ids
+            )
+            responses_str = self.tokenizer.batch_decode(original_right_side["responses"], skip_special_tokens=True)
+            responses_with_info_mask_str = self.tokenizer.batch_decode(original_right_side["responses_with_info_mask"], skip_special_tokens=True)
+            # print(f'round_idx: {round_idx}, responses_str[0]: {responses_str[0]}')
+            # print(f'round_idx: {round_idx}, responses_with_info_mask_str[0]: {responses_with_info_mask_str[0]}')
+        
+        # ===== Phase 2: Generate final camera-ready =====
+        print(f"\n[Paper Writing] Generating final camera-ready version")
+        
+
+        rollings.batch = self.tensor_fn.cut_to_effective_len(
+            rollings.batch,
+            keys=['input_ids', 'attention_mask', 'position_ids']
+        )
+        
+        gen_output = self._generate_with_gpu_padding(rollings)
+        final_ids = gen_output.batch["responses"]
+        final_str = self.tokenizer.batch_decode(final_ids, skip_special_tokens=True)
+        
+        # Extract camera-ready  content nothing different from draft
+        # camera_readys, failed_indices = self._extract_drafts_with_fallback(final_str, round_idx=num_revision_rounds)
+
+        # Update right_side (no comment this time)
+        original_right_side = self._update_right_side(
+            original_right_side, final_ids, next_obs_ids=None
+        )
+        
+        # Compose final output
+        # Keep rollout meta_info (e.g. micro_batch_size/temperature/use_dynamic_bsz/max_token_len)
+        # to stay compatible with downstream compute_log_prob in custom training paths.
+        meta_info = dict(getattr(gen_output, 'meta_info', {}) or {})
+        meta_info['num_revision_rounds'] = num_revision_rounds
+        meta_info['camera_ready_texts'] = final_str    
+        print(f"[Paper Writing] Completed {num_revision_rounds} revision rounds\n")
+        return self._compose_final_output(original_left_side, original_right_side, meta_info)
+    
+    def _extract_queries_from_batch(self, gen_batch):
+        """Extract query text from non_tensor_batch (saved during data processing)."""
+        queries = []
+        batch_size = gen_batch.batch['input_ids'].shape[0]
+
+        # Access non_tensor_batch to get extra_info
+        if hasattr(gen_batch, 'non_tensor_batch') and gen_batch.non_tensor_batch:
+            if 'extra_info' in gen_batch.non_tensor_batch:
+                extra_infos = gen_batch.non_tensor_batch['extra_info']
+                for extra_info in extra_infos:
+                    query = extra_info.get('query', '')
+                    queries.append(query)
+            else:
+                raise ValueError("extra_info not found in non_tensor_batch")
+        else:
+            raise ValueError("non_tensor_batch not available in gen_batch")
+
+        return queries
+
+    def _extract_domain_topic_from_batch(self, gen_batch):
+        """Extract domain and topic from non_tensor_batch (saved during data processing).
+        在arxiv数据集上，domain 是keywords，topic 是title
+        """
+        domains = []
+        topics = []
+
+        # Access non_tensor_batch to get extra_info
+        if hasattr(gen_batch, 'non_tensor_batch') and gen_batch.non_tensor_batch:
+            if 'extra_info' in gen_batch.non_tensor_batch:
+                extra_infos = gen_batch.non_tensor_batch['extra_info']
+                for extra_info in extra_infos:
+                    domain = extra_info.get('keywords', 'General')
+                    topic = extra_info.get('title', 'research topic')
+                    domains.append(domain)
+                    topics.append(topic)
+            else:
+                raise ValueError("extra_info not found in non_tensor_batch")
+        else:
+            raise ValueError("non_tensor_batch not available in gen_batch")
+
+        return domains, topics
+
+    def _extract_ground_truth_from_batch(self, gen_batch):
+        """Extract optional ground truth from non_tensor_batch['reward_model'].
+
+        Returns:
+            List[str]: one ground_truth per sample; empty string if not provided.
+        """
+        batch_size = gen_batch.batch['input_ids'].shape[0]
+        ground_truths = [''] * batch_size
+
+        if not (hasattr(gen_batch, 'non_tensor_batch') and gen_batch.non_tensor_batch):
+            return ground_truths
+
+        reward_models = gen_batch.non_tensor_batch.get('reward_model', None)
+        if reward_models is None:
+            return ground_truths
+
+        for i in range(min(batch_size, len(reward_models))):
+            reward_model = reward_models[i]
+            if isinstance(reward_model, dict):
+                gt = reward_model.get('ground_truth', '')
+                ground_truths[i] = gt if isinstance(gt, str) else ('' if gt is None else str(gt))
+
+        return ground_truths
+    
+    def _extract_drafts_with_fallback(self, responses_str, round_idx):
+        """
+        Extract <draft>...</draft> content from responses.
+        If missing, use empty string and log warning.
+        
+        Returns:
+            drafts: List of draft texts (empty string if tag missing)
+            failed_indices: List of sample indices that failed
+        """
+        drafts = []
+        failed_indices = []
+        
+        for i, resp in enumerate(responses_str):
+            match = re.search(r'<draft>(.*?)</draft>', resp, re.DOTALL)
+            if match:
+                drafts.append(match.group(1).strip())
+            else:
+                drafts.append('')
+                failed_indices.append(i)
+                print(f"\n[WARNING] Sample {i} missing <draft> tag in round {round_idx}")
+                print(f"Response text:\n{resp[:500]}...")
+                print()
+        
+        if failed_indices:
+            print(f"[Paper Writing] {len(failed_indices)}/{len(responses_str)} samples missing <draft> tag, continuing with empty drafts")
+        
+        return drafts, failed_indices
+    
+    def _extract_camera_ready_with_fallback(self, responses_str):
+        """
+        Extract <camera-ready>...</camera-ready> content from responses.
+        If missing, use empty string and log warning.
+        
+        Returns:
+            camera_readys: List of camera-ready texts (empty string if tag missing)
+            failed_indices: List of sample indices that failed
+        """
+        camera_readys = []
+        failed_indices = []
+        
+        for i, resp in enumerate(responses_str):
+            match = re.search(r'<camera-ready>(.*?)</camera-ready>', resp, re.DOTALL)
+            if match:
+                camera_readys.append(match.group(1).strip())
+            else:
+                camera_readys.append('')
+                failed_indices.append(i)
+                print(f"\n[WARNING] Sample {i} missing <camera-ready> tag in final round")
+                print(f"Response text:\n{resp[:500]}...")
+                print()
+        
+        if failed_indices:
+            print(f"[Paper Writing] {len(failed_indices)}/{len(responses_str)} samples missing <camera-ready> tag")
+        
+        return camera_readys, failed_indices
+    
+    async def _call_commenter_single(self, client, system_prompt, domain, topic, draft, ground_truth=''):
+        """Call Commenter API for a single sample (async)."""
+        has_ground_truth = isinstance(ground_truth, str) and len(ground_truth.strip()) > 0
+        if has_ground_truth:
+            user_content = (
+                f"Keywords: {domain}\n"
+                f"Title: {topic}\n\n"
+                f"Current Draft:\n{draft}\n\n"
+                "Reference Text (from dataset ground_truth; use only as a potentially helpful reference, "
+                "not as an absolute correct answer):\n"
+                f"{ground_truth}\n\n"
+                "Please compare the current draft with the reference text and provide specific, constructive "
+                "revision suggestions. The reference may be imperfect, so do not blindly copy it."
+            )
+        else:
+            user_content = (
+                f"Keywords: {domain}\n"
+                f"Title: {topic}\n\n"
+                f"Current Draft:\n{draft}\n\n"
+                "Please provide specific, constructive revision suggestions."
+            )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content}
+        ]
+
+        try:
+            resp = await client.chat.completions.create(
+                model=self.config.commenter_model,
+                messages=messages,
+                max_tokens=256,
+                temperature=0.8,
+                extra_body={"enable_thinking": True}
+            )
+            return resp.choices[0].message.content
+        except Exception as e:
+            print(f"[ERROR] Commenter API call failed: {e}")
+            return "Please revise your draft to improve clarity and academic rigor."
+    
+    async def _call_commenter_batch_async(self, domains, topics, drafts, ground_truths=None):
+        """Call Commenter API for a batch of samples (async parallel)."""
+        from openai import AsyncOpenAI
+
+        client = AsyncOpenAI(
+            api_key=self.config.commenter_api_key,
+            base_url=self.config.commenter_base_url
+        )
+
+        if ground_truths is None:
+            ground_truths = [''] * len(drafts)
+
+        system_prompt = (
+            "You are an experienced academic reviewer. Your task is to read abstract drafts "
+            "and provide specific, constructive revision suggestions.\n\n"
+            "CRITICAL LENGTH CONSTRAINT:\n"
+            "- Your feedback MUST be 50-80 words (approximately 70-120 tokens)\n"
+            "- Be concise and focus on the most important issues only\n"
+            "- Prioritize: 1) Clarity issues, 2) Missing key elements, 3) Structural problems\n\n"
+            "IMPORTANT OUTPUT FORMAT:\n"
+            "- Output ONLY plain text revision suggestions\n"
+            "- Do NOT use any XML tags (like <comment>, <draft>, <camera-ready>, etc.)\n"
+            "- Do NOT repeat or include the draft content in your response\n"
+            "- Provide 2-3 specific, actionable suggestions directly"
+        )
+
+        # Create parallel tasks
+        tasks = [
+            self._call_commenter_single(client, system_prompt, domain, topic, draft, ground_truth)
+            for domain, topic, draft, ground_truth in zip(domains, topics, drafts, ground_truths)
+        ]
+
+        # Execute in parallel
+        comments = await asyncio.gather(*tasks)
+
+        return comments
