@@ -1,6 +1,22 @@
 # 可外部覆盖；默认使用两张卡
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1,3}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-5,6}
 export DATA_DIR='data_paper_writing/processed'
+
+# 缓解 FSDP backward 的显存碎片，避免 reserved-but-unallocated 导致 OOM
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+
+# 本机无直连外网路由，必须走代理访问 dashscope。这里做两件事：
+# 1) 清理 SOCKS 变量（httpx+openai 会因缺 socksio 报错，且 SOCKS 常把握手搞坏）
+# 2) 若当前 http_proxy/https_proxy 仍是失效的 ofey 代理 (10.128.208.19)，
+#    自动切回本机 clash (127.0.0.1:17890)
+unset ALL_PROXY all_proxy
+if [[ -z "$http_proxy" || "$http_proxy" == *"10.128.208.19"* ]]; then
+    export http_proxy="http://127.0.0.1:17890"
+    export https_proxy="http://127.0.0.1:17890"
+    export HTTP_PROXY="$http_proxy"
+    export HTTPS_PROXY="$https_proxy"
+fi
+echo "[INFO] Proxy: http_proxy=$http_proxy https_proxy=$https_proxy"
 
 # 并发运行配置：
 # - RUN_ID 用于区分同机并行任务（必须不同）
@@ -50,7 +66,7 @@ export VLLM_ATTENTION_BACKEND=XFORMERS
 TBS=128
 VBS=32
 PPO_MINI_BATCH_SIZE=64
-PPO_MICRO_BATCH_SIZE=4
+PPO_MICRO_BATCH_SIZE=2
 LOG_PROB_MICRO_BATCH_SIZE=8
 
 # GRPO-like, KL as loss
@@ -132,7 +148,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=4096 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     actor_rollout_ref.rollout.n_agent=$GROUP_SIZE \
     actor_rollout_ref.rollout.temperature=0.8 \
     actor_rollout_ref.ref.log_prob_micro_batch_size=$LOG_PROB_MICRO_BATCH_SIZE \
@@ -145,7 +161,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
-    trainer.test_freq=50 \
+    trainer.test_freq=10 \
     trainer.total_epochs=15 \
     trainer.project_name=$WAND_PROJECT \
     trainer.experiment_name=$EXPERIMENT_NAME \
@@ -169,4 +185,5 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     +paper_writing_save_sft_candidates=$PAPER_WRITING_SAVE_SFT_CANDIDATES \
     +paper_writing_sft_score_threshold=$PAPER_WRITING_SFT_SCORE_THRESHOLD \
     +paper_writing_sft_output_dir=$PAPER_WRITING_SFT_OUTPUT_DIR \
+    max_turns=2 \
     2>&1 | tee $EXPERIMENT_NAME.log

@@ -236,31 +236,18 @@ class RewardManager():
                 penalty -= weights[round_idx] if round_idx < len(weights) else 0.01
         return penalty
 
-    def _print_paper_writing_reward_stats(self, data: DataProto, length_penalties,
-                                          draft_length_penalties, camera_length_penalties,
-                                          format_penalties, rubric_details=None):
-        valid_flags_by_round = self._to_plain_list(
-            data.meta_info.get('paper_writing_draft_valid_flags', [])
-        )
+    def _print_paper_writing_reward_stats(self, scores, rubric_details=None):
+        """Log rubric sub-scores and final outcome reward only."""
         pieces = []
-        for round_idx, round_flags in enumerate(valid_flags_by_round[:3]):
-            if round_flags:
-                invalid_rate = 1.0 - float(np.mean([bool(x) for x in round_flags]))
-                pieces.append(f"round{round_idx + 1}_invalid_rate={invalid_rate:.4f}")
-        if length_penalties:
-            pieces.append(f"length_penalty_mean={float(np.mean(length_penalties)):.4f}")
-            pieces.append(f"draft_length_penalty_mean={float(np.mean(draft_length_penalties)):.4f}")
-            pieces.append(f"camera_ready_length_penalty_mean={float(np.mean(camera_length_penalties)):.4f}")
-        if format_penalties:
-            pieces.append(f"format_penalty_mean={float(np.mean(format_penalties)):.4f}")
         if rubric_details:
             dimensions = [
                 'Problem & Motivation',
                 'Method & Contribution Coverage',
                 'Results & Evidence Coverage',
-                'Faithfulness to Reference',
+                'Topic Consistency',
                 'Clarity & Conciseness',
                 'Length Appropriateness',
+                'Format & Presentation',
             ]
             for dim in dimensions:
                 vals = [
@@ -271,6 +258,13 @@ class RewardManager():
                 if vals:
                     metric_name = dim.lower().replace(' & ', '_').replace(' ', '_')
                     pieces.append(f"rubric_{metric_name}_mean={float(np.mean(vals)):.4f}")
+        if scores:
+            format_fail_rate = sum(1 for s in scores if s == -1.0) / len(scores)
+            valid_scores = [s for s in scores if s != -1.0]
+            pieces.append(f"format_fail_rate={format_fail_rate:.4f}")
+            if valid_scores:
+                pieces.append(f"reward_mean={float(np.mean(valid_scores)):.4f}")
+            pieces.append(f"reward_mean_with_format_gate={float(np.mean(scores)):.4f}")
         if pieces:
             print("[Paper Writing Reward] " + " ".join(pieces))
 
@@ -393,13 +387,12 @@ class RewardManager():
 
     def _compute_paper_writing_reward(self, data: DataProto):
         """
-        Compute reward for paper writing task with per-segment credit assignment.
+        Pure outcome reward for paper writing.
 
-        Reward placement strategy (requires ``segment_ids`` in batch):
-        - Camera-ready last token: rubric score + camera-ready length penalty
-        - Draft i last token: draft_i format penalty + draft_i length penalty
-
-        When ``segment_ids`` is absent, falls back to legacy single-reward-at-last-token.
+        The rubric score for the camera-ready abstract is placed at the last
+        trainable token; all other token rewards are zero.
+        Format gate: if the camera-ready text still contains XML tags (i.e. the
+        model failed to submit via <camera-ready>), reward is -1.0.
         """
 
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
@@ -413,121 +406,52 @@ class RewardManager():
 
         ground_truth_texts = data.meta_info.get('paper_writing_ground_truth_texts', None)
 
-        # Call rubric scoring API for all samples
-        scores, rubric_details = self._call_rubric_scoring_api(
-            camera_ready_texts,
-            ground_truth_texts=ground_truth_texts,
-            return_details=True,
+        # Format gate: camera-ready texts containing XML tags are invalid; skip rubric for them.
+        _xml_pattern = re.compile(r'<[^>]+>')
+        format_bad = [bool(_xml_pattern.search(text)) for text in camera_ready_texts]
+        clean_indices = [i for i, bad in enumerate(format_bad) if not bad]
+        clean_texts = [camera_ready_texts[i] for i in clean_indices]
+        clean_gt = (
+            [ground_truth_texts[i] for i in clean_indices]
+            if ground_truth_texts is not None else None
         )
+        _fail_detail = {
+            'overall': -1.0, 'subscores': {},
+            'summary': 'FORMAT ERROR: XML tags detected in camera-ready output'
+        }
+        scores = [-1.0 if bad else 0.0 for bad in format_bad]
+        rubric_details = [
+            _fail_detail if bad else {'overall': 0.0, 'subscores': {}, 'summary': ''}
+            for bad in format_bad
+        ]
+        all_domains = self._to_plain_list(data.meta_info.get('paper_writing_domains', []))
+        all_topics = self._to_plain_list(data.meta_info.get('paper_writing_topics', []))
+        clean_domains = [all_domains[i] if i < len(all_domains) else '' for i in clean_indices]
+        clean_topics = [all_topics[i] if i < len(all_topics) else '' for i in clean_indices]
+        if clean_texts:
+            clean_scores, clean_details = self._call_rubric_scoring_api(
+                clean_texts,
+                ground_truth_texts=clean_gt,
+                domains=clean_domains,
+                topics=clean_topics,
+                return_details=True,
+            )
+            for pos, orig_idx in enumerate(clean_indices):
+                scores[orig_idx] = clean_scores[pos]
+                rubric_details[orig_idx] = clean_details[pos]
+        if any(format_bad):
+            print(f"[Paper Writing] Format gate: {sum(format_bad)}/{len(format_bad)} samples "
+                  f"have XML tags in camera-ready, assigned reward -1")
 
-
-        has_segment_ids = 'segment_ids' in data.batch
-
-        # Pre-compute per-round penalties
-        draft_lengths_by_round = self._to_plain_list(
-            data.meta_info.get('paper_writing_draft_lengths', []))
-        camera_ready_lengths = self._to_plain_list(
-            data.meta_info.get('paper_writing_camera_ready_lengths', []))
-        ground_truth_lengths = self._to_plain_list(
-            data.meta_info.get('paper_writing_ground_truth_lengths', []))
-        valid_flags_by_round = self._to_plain_list(
-            data.meta_info.get('paper_writing_draft_valid_flags', []))
-        num_rounds = data.meta_info.get('num_revision_rounds', len(draft_lengths_by_round))
-
-        length_penalties = []
-        draft_length_penalties = []
-        camera_length_penalties = []
-        format_penalties = []
-        final_scores = []
-
-        prompt_len = data.batch['prompts'].shape[-1]
-
+        # Place outcome reward at last trainable token; all other tokens stay zero.
         for i in range(len(data)):
-            data_item = data[i]
-            gt_len = ground_truth_lengths[i] if i < len(ground_truth_lengths) else 0
+            reward_index = self._get_last_trainable_response_index(data[i])
+            reward_tensor[i, reward_index] = float(scores[i])
 
-            # --- Camera-ready reward ---
-            camera_penalty = 0.0
-            if i < len(camera_ready_lengths):
-                camera_penalty = self._single_length_penalty(camera_ready_lengths[i], gt_len)
-            camera_score = float(scores[i]) + camera_penalty
-
-            # --- Per-draft penalties ---
-            format_weights = [0.30, 0.20, 0.10]
-            draft_len_weights = [0.50, 0.35, 0.25]
-            per_draft_penalties = []
-            total_format_penalty = 0.0
-            total_draft_len_penalty = 0.0
-            total_draft_len_weight = 0.0
-            for r in range(num_rounds):
-                fp = 0.0
-                if r < len(valid_flags_by_round) and i < len(valid_flags_by_round[r]):
-                    if not bool(valid_flags_by_round[r][i]):
-                        fp = -(format_weights[r] if r < len(format_weights) else 0.01)
-                lp = 0.0
-                if r < len(draft_lengths_by_round) and i < len(draft_lengths_by_round[r]):
-                    w = draft_len_weights[r] if r < len(draft_len_weights) else 0.05
-                    lp = w * self._single_length_penalty(draft_lengths_by_round[r][i], gt_len)
-                    total_draft_len_weight += w
-                per_draft_penalties.append(fp + lp)
-                total_format_penalty += fp
-                total_draft_len_penalty += lp
-            
-            # --- Collect aggregate metrics (for logging compatibility) ---
-            agg_draft_len_penalty = total_draft_len_penalty / total_draft_len_weight if total_draft_len_weight > 0 else 0.0
-            total_weight = total_draft_len_weight + 0.50
-            agg_len_penalty = (total_draft_len_penalty + 0.50 * camera_penalty) / total_weight if total_weight > 0 else 0.0
-            length_penalties.append(agg_len_penalty)
-            draft_length_penalties.append(agg_draft_len_penalty)
-            camera_length_penalties.append(camera_penalty)
-            format_penalties.append(total_format_penalty)
-            # final_score for logging / SFT filtering (legacy aggregate)
-            final_score = float(scores[i]) + agg_len_penalty + total_format_penalty
-            final_scores.append(final_score)
-
-            if has_segment_ids:
-                # Place rewards at per-segment last tokens
-                seg = data_item.batch['segment_ids'][prompt_len:]
-                attn = data_item.batch['attention_mask'][prompt_len:]
-                valid_len = int(attn.sum().item())
-                seg_valid = seg[:valid_len]
-
-                # Camera-ready: segment_label = 2*num_rounds + 1
-                cam_label = 2 * num_rounds + 1
-                cam_positions = (seg_valid == cam_label).nonzero(as_tuple=False).flatten()
-                if cam_positions.numel() > 0:
-                    reward_tensor[i, int(cam_positions[-1].item())] = camera_score
-                else:
-                    # Fallback: last valid token
-                    reward_tensor[i, valid_len - 1] = camera_score
-
-                # Per-draft: segment_label = 2*round_idx + 1
-                for r in range(num_rounds):
-                    draft_label = 2 * r + 1
-                    draft_positions = (seg_valid == draft_label).nonzero(as_tuple=False).flatten()
-                    if draft_positions.numel() > 0 and abs(per_draft_penalties[r]) > 1e-8:
-                        reward_tensor[i, int(draft_positions[-1].item())] = per_draft_penalties[r]
-            else:
-                # Legacy fallback: single reward at last trainable token
-                reward_index = self._get_last_trainable_response_index(data_item)
-                reward_tensor[i, reward_index] = final_score
         os.environ.get('PW_DEBUG') and __import__('pdb').set_trace()
-        pw_metrics = self._print_paper_writing_reward_stats(
-            data,
-            length_penalties,
-            draft_length_penalties,
-            camera_length_penalties,
-            format_penalties,
-            rubric_details=rubric_details,
-        )
+        pw_metrics = self._print_paper_writing_reward_stats(scores, rubric_details=rubric_details)
         self.paper_writing_metrics = pw_metrics if pw_metrics else {}
-        self._maybe_save_sft_candidates(
-            data,
-            final_scores,
-            rubric_details,
-            length_penalties,
-            format_penalties,
-        )
+        # self._maybe_save_sft_candidates(data, scores, rubric_details, [], [])
         return reward_tensor
 
     def _compute_paper_writing_arena_hybrid_reward(self, data: DataProto):
@@ -538,10 +462,32 @@ class RewardManager():
             print("[WARNING] No camera_ready_texts found in meta_info, returning zero rewards")
             return reward_tensor
 
-        rubric_scores = self._call_rubric_scoring_api(
-            camera_ready_texts,
-            ground_truth_texts=data.meta_info.get('paper_writing_ground_truth_texts', None),
+        # Format gate: same as _compute_paper_writing_reward
+        _xml_pattern = re.compile(r'<[^>]+>')
+        _format_bad = [bool(_xml_pattern.search(text)) for text in camera_ready_texts]
+        _clean_indices = [i for i, bad in enumerate(_format_bad) if not bad]
+        _clean_texts = [camera_ready_texts[i] for i in _clean_indices]
+        _clean_gt = data.meta_info.get('paper_writing_ground_truth_texts', None)
+        _clean_gt_filtered = (
+            [_clean_gt[i] for i in _clean_indices] if _clean_gt is not None else None
         )
+        _all_domains = self._to_plain_list(data.meta_info.get('paper_writing_domains', []))
+        _all_topics = self._to_plain_list(data.meta_info.get('paper_writing_topics', []))
+        _clean_domains = [_all_domains[i] if i < len(_all_domains) else '' for i in _clean_indices]
+        _clean_topics = [_all_topics[i] if i < len(_all_topics) else '' for i in _clean_indices]
+        rubric_scores = [-1.0 if bad else 0.0 for bad in _format_bad]
+        if _clean_texts:
+            _clean_rubric = self._call_rubric_scoring_api(
+                _clean_texts,
+                ground_truth_texts=_clean_gt_filtered,
+                domains=_clean_domains,
+                topics=_clean_topics,
+            )
+            for pos, orig_idx in enumerate(_clean_indices):
+                rubric_scores[orig_idx] = _clean_rubric[pos]
+        if any(_format_bad):
+            print(f"[Paper Writing/Arena] Format gate: {sum(_format_bad)}/{len(_format_bad)} samples "
+                  f"have XML tags in camera-ready, assigned reward -1")
         arena_scores = data.meta_info.get('arena_scores', None)
         if arena_scores is None or len(arena_scores) != len(camera_ready_texts):
             print("[WARNING] arena_scores missing or mismatched; fallback to rubric-only scores")
@@ -553,14 +499,20 @@ class RewardManager():
             rubric_weight = float(self.rubric_weight)
 
         for i in range(len(data)):
-            score = arena_weight * float(arena_scores[i]) + rubric_weight * float(rubric_scores[i])
+            if float(rubric_scores[i]) == -1.0:
+                score = -1.0  # format gate
+            else:
+                score = arena_weight * float(arena_scores[i]) + rubric_weight * float(rubric_scores[i])
             reward_index = self._get_last_trainable_response_index(data[i])
             reward_tensor[i, reward_index] = score
         return reward_tensor
     
-    def _call_rubric_scoring_api(self, camera_ready_texts, ground_truth_texts=None, return_details=False):
+    def _call_rubric_scoring_api(self, camera_ready_texts, ground_truth_texts=None,
+                                 domains=None, topics=None, return_details=False):
         """
         Call external API to score papers based on rubric.
+        Evaluation is based on the paper's keywords and title; ground truth is
+        provided as a reference only, not as an authoritative answer.
         Returns a list of scores (one per paper).
         """
         # Lazily create a long-lived client so we don't recreate it per sample.
@@ -570,34 +522,50 @@ class RewardManager():
                 base_url=self.rubric_api_base
             )
         client = self._rubric_client
-        
+
         rubric_prompt = (
-            "You are a senior program committee member reviewing generated camera-ready abstracts for a top-tier academic venue "
-            "(e.g., NeurIPS, ICML, ICLR, ACL). Evaluate the generated abstract strictly by comparing it with the reference abstract. "
-            "The reference abstract is ground truth for the paper content, but the generated abstract may use different wording. "
+            "You are an expert evaluator for academic paper abstracts at top-tier venues "
+            "(e.g., NeurIPS, ICML, ICLR, ACL). "
+            "You will be given a paper's keywords, title, and a generated abstract to evaluate. "
+            "A reference abstract is also provided for context — it is one possible way to write "
+            "the abstract, but it is NOT the ground truth or the only correct answer. "
+            "Do NOT penalize the generated abstract merely for phrasing differently from the reference. "
+            "Evaluate the generated abstract independently based on the keywords and title, "
+            "using the reference only as a helpful guide to the paper's content.\n\n"
             "Score each dimension from 0.0 to 1.0 (two decimal places).\n\n"
 
             "## Scoring Rubric\n\n"
 
             "### 1. Problem & Motivation\n"
-            "Does the generated abstract preserve the reference's problem setting and motivation?\n\n"
+            "Does the abstract clearly identify a research problem or gap, and explain why it matters? "
+            "Is the motivation well-grounded in the context implied by the title and keywords?\n\n"
 
             "### 2. Method & Contribution Coverage\n"
-            "Does it cover the reference's main method, technical idea, and claimed contribution without replacing them with generic claims?\n\n"
+            "Does it describe the main approach, method, or technical idea? "
+            "Does it state what is novel or what the paper contributes, without relying on vague or generic claims?\n\n"
 
             "### 3. Results & Evidence Coverage\n"
-            "Does it include the reference's important empirical/theoretical results, evidence, and impact when present?\n\n"
+            "Does it report key empirical or theoretical results, performance numbers, or evidence of the contribution's effectiveness?\n\n"
 
-            "### 4. Faithfulness to Reference\n"
-            "Is it factually consistent with the reference, without hallucinating unsupported methods, datasets, results, or claims?\n\n"
+            "### 4. Topic Consistency\n"
+            "Is the abstract's content consistent with the given title and keywords? "
+            "Does it stay on-topic, without drifting to unrelated problems or fabricating claims not plausible given the topic?\n\n"
 
             "### 5. Clarity & Conciseness\n"
-            "Is it clear, coherent, self-contained, and written like a real academic abstract?\n\n"
+            "Is it clear, coherent, and self-contained? Is it written in fluent academic prose "
+            "appropriate for a top-tier venue abstract?\n\n"
 
             "### 6. Length Appropriateness\n"
-            "Is its level of detail and length appropriate relative to the reference, without being much shorter, much longer, or overly template-like?\n\n"
+            "Is the length and level of detail appropriate for an abstract — "
+            "neither too brief to be informative nor too long and unfocused?\n\n"
 
-            "Use 1.0 for excellent, 0.8 for good with minor omissions, 0.6 for partially adequate, "
+            "### 7. Format & Presentation\n"
+            "Is the abstract presented as clean plain-text academic prose?\n"
+            "Penalize heavily for: residual XML tags (e.g. <draft>, <camera-ready>), markdown formatting, "
+            "bullet points, numbered lists, or any non-academic structural artifacts.\n"
+            "Score 1.0 if completely clean prose; 0.0 if heavily polluted with tags or non-prose artifacts.\n\n"
+
+            "Use 1.0 for excellent, 0.8 for good with minor issues, 0.6 for partially adequate, "
             "0.4 for weak, 0.2 for very poor, and 0.0 for missing or unusable.\n\n"
 
             "## Output Format\n"
@@ -605,21 +573,23 @@ class RewardManager():
             "Problem & Motivation: [score]\n"
             "Method & Contribution Coverage: [score]\n"
             "Results & Evidence Coverage: [score]\n"
-            "Faithfulness to Reference: [score]\n"
+            "Topic Consistency: [score]\n"
             "Clarity & Conciseness: [score]\n"
             "Length Appropriateness: [score]\n"
+            "Format & Presentation: [score]\n"
             "Summary: [2-3 sentence overall assessment]\n\n"
 
             "Example:\n"
             "Problem & Motivation: 0.80\n"
             "Method & Contribution Coverage: 0.70\n"
             "Results & Evidence Coverage: 0.60\n"
-            "Faithfulness to Reference: 0.85\n"
+            "Topic Consistency: 0.85\n"
             "Clarity & Conciseness: 0.75\n"
             "Length Appropriateness: 0.70\n"
-            "Summary: The generated abstract preserves the main problem and is mostly faithful to the reference, "
-            "but it omits some result details and is slightly too generic."
-        ) 
+            "Format & Presentation: 1.00\n"
+            "Summary: The abstract clearly addresses the stated topic and presents a coherent contribution, "
+            "but omits key result details and is slightly generic in its method description."
+        )
 
         # Preserve output order: one score per paper in the same order as input.
         num_papers = len(camera_ready_texts)
@@ -627,15 +597,24 @@ class RewardManager():
         details = [{'overall': 0.0, 'subscores': {}, 'summary': ''} for _ in range(num_papers)]
         if ground_truth_texts is None:
             ground_truth_texts = [''] * num_papers
+        if domains is None:
+            domains = [''] * num_papers
+        if topics is None:
+            topics = [''] * num_papers
 
-        def _score_single(idx, paper_text, ground_truth_text):
+        def _score_single(idx, paper_text, ground_truth_text, domain, topic):
             """Score a single paper using the rubric API."""
             try:
+                ref_block = (
+                    f"Reference abstract (for reference only — not the ground truth):\n{ground_truth_text}"
+                    if ground_truth_text and ground_truth_text.strip()
+                    else "Reference abstract: [not provided]"
+                )
                 user_content = (
-                    "Reference abstract:\n\n"
-                    f"{ground_truth_text or '[missing reference]'}\n\n"
-                    "Generated camera-ready abstract to review:\n\n"
-                    f"{paper_text}"
+                    f"Keywords: {domain or '[not provided]'}\n"
+                    f"Title: {topic or '[not provided]'}\n\n"
+                    f"{ref_block}\n\n"
+                    f"Abstract to evaluate:\n{paper_text}"
                 )
                 messages = [
                     {"role": "system", "content": rubric_prompt},
@@ -650,15 +629,11 @@ class RewardManager():
                     extra_body={"enable_thinking": False}
                 )
 
-                # Parse scores from response
                 score_text = response.choices[0].message.content
                 detail = self._parse_rubric_scores(score_text)
                 score = float(detail.get('overall', 0.0))
-                # if score == 0:
-                #     pdb.set_trace()
                 return score, detail
             except Exception as e:
-                # Keep existing behavior style: print error and return 0.0 for this sample.
                 print(f"[ERROR] Rubric scoring API failed: {e}")
                 return 0.0, {'overall': 0.0, 'subscores': {}, 'summary': ''}
 
@@ -669,7 +644,9 @@ class RewardManager():
                     _score_single,
                     idx,
                     paper_text,
-                    ground_truth_texts[idx] if idx < len(ground_truth_texts) else ''
+                    ground_truth_texts[idx] if idx < len(ground_truth_texts) else '',
+                    domains[idx] if idx < len(domains) else '',
+                    topics[idx] if idx < len(topics) else '',
                 ): idx
                 for idx, paper_text in enumerate(camera_ready_texts)
             }
@@ -697,9 +674,10 @@ class RewardManager():
             'Problem & Motivation',
             'Method & Contribution Coverage',
             'Results & Evidence Coverage',
-            'Faithfulness to Reference',
+            'Topic Consistency',
             'Clarity & Conciseness',
             'Length Appropriateness',
+            'Format & Presentation',
         ]
         scores = []
         subscores = {}

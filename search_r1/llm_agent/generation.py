@@ -909,23 +909,28 @@ If I want to give the final answer, I should put the answer between <answer> and
                 actions.append(None)
                 contents.append('')
 
-        # Collect drafts that need commenter feedback (active samples only)
-        draft_indices = [
+        # Collect all active non-camera-ready samples for commenter feedback.
+        # For draft actions: pass extracted inner content.
+        # For invalid actions: pass raw response so commenter can identify format issues.
+        commenter_indices = [
             i for i, (action, active) in enumerate(zip(actions, active_mask))
-            if active and action == 'draft'
+            if active and action != 'camera-ready'
         ]
-        if draft_indices:
-            draft_domains = [domains[i] for i in draft_indices]
-            draft_topics = [topics[i] for i in draft_indices]
-            draft_texts = [contents[i] for i in draft_indices]
-            draft_ground_truths = [ground_truths[i] for i in draft_indices]
-            comments = self._call_commenter_batch(
-                draft_domains, draft_topics, draft_texts, draft_ground_truths
+        if commenter_indices:
+            commenter_domains = [domains[i] for i in commenter_indices]
+            commenter_topics = [topics[i] for i in commenter_indices]
+            commenter_texts = [
+                contents[i] if actions[i] == 'draft' else responses_str[i]
+                for i in commenter_indices
+            ]
+            commenter_ground_truths = [ground_truths[i] for i in commenter_indices]
+            all_comments = self._call_commenter_batch(
+                commenter_domains, commenter_topics, commenter_texts, commenter_ground_truths
             )
+            comment_map = {idx: comment for idx, comment in zip(commenter_indices, all_comments)}
         else:
-            comments = []
+            comment_map = {}
 
-        comment_iter = iter(comments)
         next_obs, dones, valid_action, is_comment, camera_ready_contents = [], [], [], [], []
         for i, (action, active) in enumerate(zip(actions, active_mask)):
             if not active:
@@ -941,22 +946,18 @@ If I want to give the final answer, I should put the answer between <answer> and
                 is_comment.append(0)
                 camera_ready_contents.append(contents[i])
             elif action == 'draft':
-                feedback = next(comment_iter)
+                feedback = comment_map[i]
                 next_obs.append(f'\n\n<comment>{feedback}</comment>\n\n')
                 dones.append(0)
                 valid_action.append(1)
                 is_comment.append(1)
                 camera_ready_contents.append('')
             else:
-                next_obs.append(
-                    '\nMy previous action is invalid. '
-                    'If I want to request reviewer feedback, I should put my draft between <draft> and </draft>. '
-                    'If I want to submit my final abstract, I should put it between <camera-ready> and </camera-ready>. '
-                    'Let me try again.\n'
-                )
+                feedback = comment_map[i]
+                next_obs.append(f'\n\n<comment>{feedback}</comment>\n\n')
                 dones.append(0)
                 valid_action.append(0)
-                is_comment.append(0)
+                is_comment.append(1)
                 camera_ready_contents.append('')
 
         return next_obs, dones, valid_action, is_comment, camera_ready_contents
@@ -1680,6 +1681,7 @@ If I want to give the final answer, I should put the answer between <answer> and
             original_right_side = self._update_right_side(
                 original_right_side, responses_ids, next_obs_ids
             )
+            # pdb.set_trace()
 
         # Forced final generation for samples that exhausted max_turns without <camera-ready>
         if active_mask.sum():
@@ -1702,10 +1704,12 @@ If I want to give the final answer, I should put the answer between <answer> and
                 responses_ids, responses_str, active_mask
             )
 
-            # Record raw output as camera_ready for still-active samples (evaluator handles format check)
+            # Try to extract <camera-ready> tag content; fall back to raw output.
+            # Evaluator will apply a format gate: raw output containing XML tags gets reward -1.
             for i, (active, text) in enumerate(zip(active_mask.tolist(), responses_str)):
                 if active:
-                    camera_ready_texts[i] = text
+                    match = re.search(r'<camera-ready>(.*?)</camera-ready>', text, re.DOTALL)
+                    camera_ready_texts[i] = match.group(1).strip() if match else text
 
             original_right_side = self._update_right_side(
                 original_right_side, responses_ids
@@ -1963,13 +1967,20 @@ If I want to give the final answer, I should put the answer between <answer> and
         system_prompt = (
             "You are an experienced academic reviewer. Your task is to read abstract drafts "
             "and provide specific, constructive revision suggestions.\n\n"
+            "FORMAT CHECK (do this first):\n"
+            "- Check whether the input is clean academic prose: no XML tags (e.g. <draft>, "
+            "<camera-ready>), no markdown, no bullet points, no template placeholders.\n"
+            "- If format issues are found, start your feedback with \"FORMAT NOTE: [describe the issue]\" "
+            "on the first line, then continue with content suggestions as usual.\n"
+            "- If the format is clean, skip the FORMAT NOTE line entirely.\n\n"
             "CRITICAL LENGTH CONSTRAINT:\n"
             "- Your feedback MUST be 50-80 words (approximately 70-120 tokens)\n"
             "- Be concise and focus on the most important issues only\n"
-            "- Prioritize: 1) Clarity issues, 2) Missing key elements, 3) Structural problems\n\n"
+            "- Prioritize: 1) Format issues (if any), 2) Clarity issues, 3) Missing key elements, "
+            "4) Structural problems\n\n"
             "IMPORTANT OUTPUT FORMAT:\n"
             "- Output ONLY plain text revision suggestions\n"
-            "- Do NOT use any XML tags (like <comment>, <draft>, <camera-ready>, etc.)\n"
+            "- Do NOT use any XML tags (like <comment>, <draft>, <camera-ready>, etc.) in your response\n"
             "- Do NOT repeat or include the draft content in your response\n"
             "- Provide 2-3 specific, actionable suggestions directly"
         )

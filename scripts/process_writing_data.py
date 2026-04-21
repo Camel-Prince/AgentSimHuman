@@ -39,54 +39,42 @@ You will iteratively write and refine an abstract draft based on reviewer feedba
 
 
 def process_row(row):
-    """Process a single row of data."""
-    try:
-        # Extract required fields
-        domain = row['extra_info'].get('domain')
-        topic = row['extra_info'].get('topic')
+    """Process a single row of data.
 
-        # Skip if any required field is missing
-        if not domain or not topic:
-            print(f"Warning: Skipping row {row['data_source']} due to missing fields")
+    Replaces the system prompt in existing arxiv_writing_*.parquet rows.
+    These rows use keywords/title (not domain/topic) in extra_info.
+    The user message is kept as-is; only the system message is updated.
+    """
+    try:
+        existing_prompt = row['prompt']
+
+        # Find the existing user message content
+        user_message = None
+        for msg in existing_prompt:
+            if msg['role'] == 'user':
+                user_message = msg['content']
+                break
+
+        if user_message is None:
+            print(f"Warning: Skipping row {row['data_source']} — no user message found")
             return None
 
-        # Construct user message - task is to write an abstract
-        user_message = f"""## Writing Task
-
-**Domain**: {domain}
-**Topic**: {topic}
-
-**Task Description**: Write an abstract for an academic paper about {topic} in {domain}. The abstract should be 150-250 words and cover: motivation, method, key results, and conclusion.
-
----
-
-Please write your draft now."""
-
-        # Construct new prompt (chat format)
+        # Rebuild prompt with new system prompt, keeping original user message
         new_prompt = [
-            {
-                'role': 'system',
-                'content': SYSTEM_PROMPT
-            },
-            {
-                'role': 'user',
-                'content': user_message
-            }
+            {'role': 'system', 'content': SYSTEM_PROMPT},
+            {'role': 'user', 'content': user_message},
         ]
 
-        # Clean extra_info (keep domain, topic, and full query for reference)
-        new_extra_info = {
-            'domain': domain,
-            'topic': topic,
-            'query': SYSTEM_PROMPT + user_message
-        }
+        # Update extra_info: preserve all existing keys, update query
+        new_extra_info = dict(row['extra_info'])
+        new_extra_info['query'] = SYSTEM_PROMPT + user_message
 
         return {
             'data_source': row['data_source'],
             'ability': row['ability'],
             'prompt': new_prompt,
             'extra_info': new_extra_info,
-            'reward_model': row['reward_model']
+            'reward_model': row['reward_model'],
         }
 
     except Exception as e:
@@ -128,11 +116,11 @@ def process_file(input_path, output_path):
 def main():
     """Main processing function."""
     base_dir = Path('/home/wangzixu/Search-R1/data_paper_writing/processed')
-    
-    # Define input and output files
+
+    # In-place update of arxiv_writing_*.parquet files
     files_to_process = [
-        ('train_prompts_chat.parquet', 'train_prompts_query_only.parquet'),
-        ('val_prompts_chat.parquet', 'val_prompts_query_only.parquet')
+        ('arxiv_writing_train.parquet', 'arxiv_writing_train.parquet'),
+        ('arxiv_writing_valid.parquet', 'arxiv_writing_valid.parquet'),
     ]
     
     total_processed = 0
