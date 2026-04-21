@@ -482,6 +482,11 @@ class RayPPOTrainer(object):
                 gen_batch=gen_batch,
                 initial_input_ids=first_input_ids,
             )
+        if task_type == 'paper_writing_autonomous':
+            return generation_manager.run_llm_loop_paper_writing_autonomous(
+                gen_batch=gen_batch,
+                initial_input_ids=first_input_ids,
+            )
         return generation_manager.run_llm_loop(
             gen_batch=gen_batch,
             initial_input_ids=first_input_ids,

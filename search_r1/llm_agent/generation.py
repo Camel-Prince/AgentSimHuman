@@ -220,6 +220,25 @@ class LLMGenerationManager:
         responses = self._batch_tokenize(responses_str)
         return responses, responses_str
 
+    def _postprocess_responses_paper_writing_autonomous(self, responses: torch.Tensor) -> Tuple[torch.Tensor, List[str]]:
+        """Postprocess responses for autonomous paper writing loop.
+
+        Truncates at the first </draft> or </camera-ready> closing tag, mirroring
+        how _postprocess_responses truncates at </search> or </answer>.
+        """
+        responses_str = self.tokenizer.batch_decode(responses, skip_special_tokens=True)
+        processed_responses = []
+        for resp in responses_str:
+            if '</draft>' in resp:
+                processed_responses.append(resp.split('</draft>')[0] + '</draft>')
+            elif '</camera-ready>' in resp:
+                processed_responses.append(resp.split('</camera-ready>')[0] + '</camera-ready>')
+            else:
+                processed_responses.append(resp)
+        responses_str = processed_responses
+        responses = self._batch_tokenize(responses_str)
+        return responses, responses_str
+
     def _process_next_obs(self, next_obs: List[str]) -> torch.Tensor:
         """Process next observations from environment, into token ids, avoid truncation."""
         
@@ -620,7 +639,7 @@ class LLMGenerationManager:
             # 🌟Execute in environment and process observations
             next_obs, dones, valid_action, is_search = self.execute_predictions(
                 responses_str, self.tokenizer.pad_token, active_mask,
-                do_search = False, #only for debug
+                do_search = True,
             )
             """
             以一个batch-size = 2的为例子，第一个问题调用了外部retriever，第二个问题没有。
@@ -646,7 +665,7 @@ class LLMGenerationManager:
                 next_obs_ids
             ) # 将作为下一个turn的输入
             """
-             [原始prompt] + [<think>...</think><search>telephone inventor</search>] +
+             [SYSTEM_prompt] + [<think>...</think><search>telephone inventor</search>] +
                 [<information>Doc1...</information>] 
             """
             
@@ -858,6 +877,89 @@ If I want to give the final answer, I should put the answer between <answer> and
             format_reference += f"Doc {idx+1}(Title: {title}) {text}\n"
 
         return format_reference
+
+    def _execute_paper_writing_autonomous(
+        self,
+        responses_str: List[str],
+        active_mask,
+        domains: List[str],
+        topics: List[str],
+        ground_truths: List[str],
+    ) -> Tuple[List[str], List[int], List[int], List[int], List[str]]:
+        """Execute one step of the autonomous paper writing loop.
+
+        Mirrors execute_predictions for QA search/answer:
+          - action='draft'        -> call commenter API, obs=<comment>...</comment>, done=False
+          - action='camera-ready' -> done=True, obs=''
+          - action=None           -> invalid-action feedback, done=False
+
+        Returns:
+            next_obs, dones, valid_action, is_comment, camera_ready_contents
+            camera_ready_contents: per-sample extracted <camera-ready> content ('' if not done)
+        """
+        pattern = r'<(draft|camera-ready)>(.*?)</\1>'
+        actions = []
+        contents = []
+        for resp in responses_str:
+            match = re.search(pattern, resp, re.DOTALL)
+            if match:
+                actions.append(match.group(1))
+                contents.append(match.group(2).strip())
+            else:
+                actions.append(None)
+                contents.append('')
+
+        # Collect drafts that need commenter feedback (active samples only)
+        draft_indices = [
+            i for i, (action, active) in enumerate(zip(actions, active_mask))
+            if active and action == 'draft'
+        ]
+        if draft_indices:
+            draft_domains = [domains[i] for i in draft_indices]
+            draft_topics = [topics[i] for i in draft_indices]
+            draft_texts = [contents[i] for i in draft_indices]
+            draft_ground_truths = [ground_truths[i] for i in draft_indices]
+            comments = self._call_commenter_batch(
+                draft_domains, draft_topics, draft_texts, draft_ground_truths
+            )
+        else:
+            comments = []
+
+        comment_iter = iter(comments)
+        next_obs, dones, valid_action, is_comment, camera_ready_contents = [], [], [], [], []
+        for i, (action, active) in enumerate(zip(actions, active_mask)):
+            if not active:
+                next_obs.append('')
+                dones.append(1)
+                valid_action.append(0)
+                is_comment.append(0)
+                camera_ready_contents.append('')
+            elif action == 'camera-ready':
+                next_obs.append('')
+                dones.append(1)
+                valid_action.append(1)
+                is_comment.append(0)
+                camera_ready_contents.append(contents[i])
+            elif action == 'draft':
+                feedback = next(comment_iter)
+                next_obs.append(f'\n\n<comment>{feedback}</comment>\n\n')
+                dones.append(0)
+                valid_action.append(1)
+                is_comment.append(1)
+                camera_ready_contents.append('')
+            else:
+                next_obs.append(
+                    '\nMy previous action is invalid. '
+                    'If I want to request reviewer feedback, I should put my draft between <draft> and </draft>. '
+                    'If I want to submit my final abstract, I should put it between <camera-ready> and </camera-ready>. '
+                    'Let me try again.\n'
+                )
+                dones.append(0)
+                valid_action.append(0)
+                is_comment.append(0)
+                camera_ready_contents.append('')
+
+        return next_obs, dones, valid_action, is_comment, camera_ready_contents
 
 
     # ========== Paper Writing Specific Methods ==========
@@ -1494,7 +1596,132 @@ If I want to give the final answer, I should put the answer between <answer> and
         base_output.meta_info['arena_seed_mode'] = getattr(self.config, 'arena_seed_mode', 'swiss_single_round')
         base_output.meta_info['trace_mode'] = 'arena_seeded'
         return base_output
-    
+
+    def run_llm_loop_paper_writing_autonomous(self, gen_batch, initial_input_ids: torch.Tensor):
+        """
+        自主决策论文写作循环（Autonomous 版本）。
+
+        完全镜像 run_llm_loop 的 active_mask 架构：
+          - LLM 输出 <draft>text</draft>         -> 触发 commenter API，返回 <comment>feedback</comment>，继续
+          - LLM 输出 <camera-ready>text</camera-ready> -> 完成，记录 camera_ready_texts
+          - rollout 中间不插入任何额外 instruction，LLM 自主决定何时终止。
+
+        强制最终轮（max_turns 用完仍 active）：
+          直接 append 原始输出到 right_side，格式由 reward evaluator 判断。
+
+        final_output meta_info:
+          - camera_ready_texts: List[str]  (供 reward 使用)
+          - trace_mode: 'autonomous'
+        """
+        original_left_side = {'input_ids': initial_input_ids[:, -self.config.max_start_length:]}
+        original_right_side = {
+            'responses': initial_input_ids[:, []],
+            'responses_with_info_mask': initial_input_ids[:, []]
+        }
+
+        batch_size = gen_batch.batch['input_ids'].shape[0]
+        active_mask = torch.ones(batch_size, dtype=torch.bool)
+        turns_stats = torch.ones(batch_size, dtype=torch.int)
+        valid_action_stats = torch.zeros(batch_size, dtype=torch.int)
+        valid_comment_stats = torch.zeros(batch_size, dtype=torch.int)
+        active_num_list = [active_mask.sum().item()]
+        camera_ready_texts = [''] * batch_size
+        rollings = gen_batch
+
+        domains, topics = self._extract_domain_topic_from_batch(gen_batch)
+        ground_truths = self._extract_ground_truth_from_batch(gen_batch)
+
+        print(f"\n[Paper Writing/Autonomous] Starting autonomous loop (max_turns={self.config.max_turns})")
+        meta_info = {}
+
+        # Main generation loop
+        for step in range(self.config.max_turns):
+            if not active_mask.sum():
+                break
+
+            rollings.batch = self.tensor_fn.cut_to_effective_len(
+                rollings.batch,
+                keys=['input_ids', 'attention_mask', 'position_ids']
+            )
+
+            rollings_active = DataProto.from_dict({
+                k: v[active_mask] for k, v in rollings.batch.items()
+            })
+            gen_output = self._generate_with_gpu_padding(rollings_active)
+            meta_info = gen_output.meta_info
+
+            responses_ids, responses_str = self._postprocess_responses_paper_writing_autonomous(
+                gen_output.batch['responses']
+            )
+            responses_ids, responses_str = self.tensor_fn._example_level_pad(
+                responses_ids, responses_str, active_mask
+            )
+
+            next_obs, dones, valid_action, is_comment, camera_ready_contents = \
+                self._execute_paper_writing_autonomous(
+                    responses_str, active_mask,
+                    domains=domains, topics=topics, ground_truths=ground_truths
+                )
+
+            # Record camera-ready texts for samples that just finished this step
+            for i, content in enumerate(camera_ready_contents):
+                if content and not camera_ready_texts[i]:
+                    camera_ready_texts[i] = content
+
+            curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
+            active_mask = active_mask * curr_active_mask
+            active_num_list.append(active_mask.sum().item())
+            turns_stats[curr_active_mask] += 1
+            valid_action_stats += torch.tensor(valid_action, dtype=torch.int)
+            valid_comment_stats += torch.tensor(is_comment, dtype=torch.int)
+
+            next_obs_ids = self._process_next_obs(next_obs)
+            rollings = self._update_rolling_state(rollings, responses_ids, next_obs_ids)
+            original_right_side = self._update_right_side(
+                original_right_side, responses_ids, next_obs_ids
+            )
+
+        # Forced final generation for samples that exhausted max_turns without <camera-ready>
+        if active_mask.sum():
+            print(f"[Paper Writing/Autonomous] {active_mask.sum().item()} sample(s) exhausted "
+                  f"max_turns, forcing final generation")
+            rollings.batch = self.tensor_fn.cut_to_effective_len(
+                rollings.batch,
+                keys=['input_ids', 'attention_mask', 'position_ids']
+            )
+            rollings_active = DataProto.from_dict({
+                k: v[active_mask] for k, v in rollings.batch.items()
+            })
+            gen_output = self._generate_with_gpu_padding(rollings_active)
+            meta_info = gen_output.meta_info
+
+            responses_ids, responses_str = self._postprocess_responses_paper_writing_autonomous(
+                gen_output.batch['responses']
+            )
+            responses_ids, responses_str = self.tensor_fn._example_level_pad(
+                responses_ids, responses_str, active_mask
+            )
+
+            # Record raw output as camera_ready for still-active samples (evaluator handles format check)
+            for i, (active, text) in enumerate(zip(active_mask.tolist(), responses_str)):
+                if active:
+                    camera_ready_texts[i] = text
+
+            original_right_side = self._update_right_side(
+                original_right_side, responses_ids
+            )
+
+        meta_info = dict(meta_info)
+        meta_info['camera_ready_texts'] = camera_ready_texts
+        meta_info['turns_stats'] = turns_stats.tolist()
+        meta_info['active_mask'] = active_mask.tolist()
+        meta_info['valid_action_stats'] = valid_action_stats.tolist()
+        meta_info['valid_comment_stats'] = valid_comment_stats.tolist()
+        meta_info['trace_mode'] = 'autonomous'
+
+        print(f"[Paper Writing/Autonomous] ACTIVE_TRAJ_NUM: {active_num_list}")
+        return self._compose_final_output(original_left_side, original_right_side, meta_info)
+
     def _extract_queries_from_batch(self, gen_batch):
         """Extract query text from non_tensor_batch (saved during data processing)."""
         queries = []
