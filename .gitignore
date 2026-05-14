@@ -134,3 +134,5 @@ monitor_outputs/
 
 # Large dataset files (use Git LFS or download separately)
 data_paper_writing/processed/*.parquet
+# Local checkpoints
+verl_checkpoints/

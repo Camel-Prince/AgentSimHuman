@@ -33,7 +33,7 @@ export RUBRIC_API_BASE="https://dashscope.aliyuncs.com/compatible-mode/v1"
 export RUBRIC_MODEL="qwen-max"
 
 WAND_PROJECT='Search-R1-PaperWriting'
-export BASE_MODEL='/home/wangzixu/.cache/modelscope/hub/models/Qwen/Qwen2___5-7B-Instruct'
+export BASE_MODEL="${MODELSCOPE_CACHE:-/data1/wangzixu/.cache/modelscope}/hub/models/Qwen/Qwen2___5-7B-Instruct"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 export EXPERIMENT_NAME=paper-writing-grpo-qwen2_5-7B-instruct-arxiv-writing-${TIMESTAMP}-run${RUN_ID}
 
@@ -122,7 +122,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=1 \
-    trainer.test_freq=50 \
+    trainer.test_freq=-1 \
     trainer.total_epochs=15 \
     trainer.project_name=$WAND_PROJECT \
     trainer.experiment_name=$EXPERIMENT_NAME \

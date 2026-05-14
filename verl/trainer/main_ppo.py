@@ -385,6 +385,57 @@ class RewardManager():
                 f.write(json.dumps(record, ensure_ascii=False) + '\n')
         print(f"[Paper Writing SFT] saved_candidates={len(records)} path={path}")
 
+    @staticmethod
+    def _extract_camera_ready_body(text: str):
+        """Relaxed format gate + body extraction for camera-ready outputs.
+
+        Rules:
+          - Exactly one ``<camera-ready>...</camera-ready>`` block (accepted).
+          - Else exactly one ``<draft>...</draft>`` block (also accepted as
+            camera-ready body — the model sometimes submits inside ``<draft>``).
+          - Plain prose with no XML tags (accepted as-is).
+          - Anything else (multiple blocks, nested/other tags, body still
+            containing ``<...>``) → format_bad, reward -1.
+
+        Returns:
+            (body: str, format_bad: bool)
+        """
+        if not isinstance(text, str):
+            return ('', True)
+        stripped = text.strip()
+        tag_pattern = re.compile(r'<[^>]+>')
+        cr_blocks = re.findall(r'<camera-ready>(.*?)</camera-ready>', stripped, re.DOTALL)
+        draft_blocks = re.findall(r'<draft>(.*?)</draft>', stripped, re.DOTALL)
+        total_tags = len(tag_pattern.findall(stripped))
+
+        if len(cr_blocks) == 1 and len(draft_blocks) == 0:
+            # Exactly one <camera-ready> block, no draft.
+            if total_tags != 2:  # must be exactly <camera-ready> and </camera-ready>
+                return (cr_blocks[0].strip(), True)
+            body = cr_blocks[0].strip()
+            if tag_pattern.search(body):
+                return (body, True)
+            return (body, False)
+
+        if len(draft_blocks) == 1 and len(cr_blocks) == 0:
+            # Exactly one <draft> block used as camera-ready fallback.
+            if total_tags != 2:
+                return (draft_blocks[0].strip(), True)
+            body = draft_blocks[0].strip()
+            if tag_pattern.search(body):
+                return (body, True)
+            return (body, False)
+
+        if not cr_blocks and not draft_blocks:
+            # No recognized tags at all.
+            if total_tags == 0:
+                return (stripped, False)
+            return (stripped, True)
+
+        # Multiple blocks, or mixed camera-ready + draft.
+        body = (cr_blocks[0] if cr_blocks else draft_blocks[0]).strip()
+        return (body, True)
+
     def _compute_paper_writing_reward(self, data: DataProto):
         """
         Pure outcome reward for paper writing.
@@ -397,18 +448,23 @@ class RewardManager():
 
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
 
-        # Get camera-ready texts from meta_info
-        camera_ready_texts = data.meta_info.get('camera_ready_texts', [])
+        # Get camera-ready texts and format flags from non_tensor_batch (set during rollout).
+        nt = data.non_tensor_batch or {}
+        camera_ready_arr = nt.get('camera_ready', None)
+        format_ok_arr = nt.get('format_ok', None)
 
-        if not camera_ready_texts:
-            print("[WARNING] No camera_ready_texts found in meta_info, returning zero rewards")
+        if camera_ready_arr is None:
+            print("[WARNING] No camera_ready found in non_tensor_batch, returning zero rewards")
             return reward_tensor
+
+        batch_size = len(camera_ready_arr)
+        camera_ready_texts = [str(x) for x in camera_ready_arr]
+        # format gate already applied in generation; invert format_ok to get format_bad.
+        format_bad = [not bool(x) for x in format_ok_arr] if format_ok_arr is not None \
+            else [True] * batch_size
 
         ground_truth_texts = data.meta_info.get('paper_writing_ground_truth_texts', None)
 
-        # Format gate: camera-ready texts containing XML tags are invalid; skip rubric for them.
-        _xml_pattern = re.compile(r'<[^>]+>')
-        format_bad = [bool(_xml_pattern.search(text)) for text in camera_ready_texts]
         clean_indices = [i for i, bad in enumerate(format_bad) if not bad]
         clean_texts = [camera_ready_texts[i] for i in clean_indices]
         clean_gt = (
@@ -451,20 +507,31 @@ class RewardManager():
         os.environ.get('PW_DEBUG') and __import__('pdb').set_trace()
         pw_metrics = self._print_paper_writing_reward_stats(scores, rubric_details=rubric_details)
         self.paper_writing_metrics = pw_metrics if pw_metrics else {}
+        # Expose per-sample details so downstream code (e.g. rollout dump) can use them.
+        data.meta_info['paper_writing_rubric_details'] = rubric_details
+        data.meta_info['paper_writing_format_bad'] = format_bad
         # self._maybe_save_sft_candidates(data, scores, rubric_details, [], [])
         return reward_tensor
 
     def _compute_paper_writing_arena_hybrid_reward(self, data: DataProto):
         """Compute hybrid reward = arena_weight * arena + rubric_weight * rubric."""
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
-        camera_ready_texts = data.meta_info.get('camera_ready_texts', [])
-        if not camera_ready_texts:
-            print("[WARNING] No camera_ready_texts found in meta_info, returning zero rewards")
+
+        # Get camera-ready texts and format flags from non_tensor_batch (set during rollout).
+        nt = data.non_tensor_batch or {}
+        camera_ready_arr = nt.get('camera_ready', None)
+        format_ok_arr = nt.get('format_ok', None)
+
+        if camera_ready_arr is None:
+            print("[WARNING] No camera_ready found in non_tensor_batch, returning zero rewards")
             return reward_tensor
 
-        # Format gate: same as _compute_paper_writing_reward
-        _xml_pattern = re.compile(r'<[^>]+>')
-        _format_bad = [bool(_xml_pattern.search(text)) for text in camera_ready_texts]
+        batch_size = len(camera_ready_arr)
+        camera_ready_texts = [str(x) for x in camera_ready_arr]
+        # format gate already applied in generation; invert format_ok to get format_bad.
+        _format_bad = [not bool(x) for x in format_ok_arr] if format_ok_arr is not None \
+            else [True] * batch_size
+
         _clean_indices = [i for i, bad in enumerate(_format_bad) if not bad]
         _clean_texts = [camera_ready_texts[i] for i in _clean_indices]
         _clean_gt = data.meta_info.get('paper_writing_ground_truth_texts', None)
@@ -476,15 +543,26 @@ class RewardManager():
         _clean_domains = [_all_domains[i] if i < len(_all_domains) else '' for i in _clean_indices]
         _clean_topics = [_all_topics[i] if i < len(_all_topics) else '' for i in _clean_indices]
         rubric_scores = [-1.0 if bad else 0.0 for bad in _format_bad]
+        _fail_detail = {
+            'overall': -1.0, 'subscores': {},
+            'summary': 'FORMAT ERROR: XML tags detected in camera-ready output',
+            'raw': '',
+        }
+        rubric_details = [
+            dict(_fail_detail) if bad else {'overall': 0.0, 'subscores': {}, 'summary': '', 'raw': ''}
+            for bad in _format_bad
+        ]
         if _clean_texts:
-            _clean_rubric = self._call_rubric_scoring_api(
+            _clean_rubric, _clean_details = self._call_rubric_scoring_api(
                 _clean_texts,
                 ground_truth_texts=_clean_gt_filtered,
                 domains=_clean_domains,
                 topics=_clean_topics,
+                return_details=True,
             )
             for pos, orig_idx in enumerate(_clean_indices):
                 rubric_scores[orig_idx] = _clean_rubric[pos]
+                rubric_details[orig_idx] = _clean_details[pos]
         if any(_format_bad):
             print(f"[Paper Writing/Arena] Format gate: {sum(_format_bad)}/{len(_format_bad)} samples "
                   f"have XML tags in camera-ready, assigned reward -1")
@@ -505,6 +583,9 @@ class RewardManager():
                 score = arena_weight * float(arena_scores[i]) + rubric_weight * float(rubric_scores[i])
             reward_index = self._get_last_trainable_response_index(data[i])
             reward_tensor[i, reward_index] = score
+        # Expose per-sample details so downstream code (e.g. rollout dump) can use them.
+        data.meta_info['paper_writing_rubric_details'] = rubric_details
+        data.meta_info['paper_writing_format_bad'] = _format_bad
         return reward_tensor
     
     def _call_rubric_scoring_api(self, camera_ready_texts, ground_truth_texts=None,
@@ -519,7 +600,9 @@ class RewardManager():
         if self._rubric_client is None:
             self._rubric_client = openai.OpenAI(
                 api_key=self.rubric_api_key,
-                base_url=self.rubric_api_base
+                base_url=self.rubric_api_base,
+                timeout=60,  # Set a reasonable timeout for rubric API calls
+                max_retries=3  # Disable retries to fail fast on issues
             )
         client = self._rubric_client
 
@@ -631,11 +714,12 @@ class RewardManager():
 
                 score_text = response.choices[0].message.content
                 detail = self._parse_rubric_scores(score_text)
+                detail['raw'] = score_text
                 score = float(detail.get('overall', 0.0))
                 return score, detail
             except Exception as e:
                 print(f"[ERROR] Rubric scoring API failed: {e}")
-                return 0.0, {'overall': 0.0, 'subscores': {}, 'summary': ''}
+                return 0.0, {'overall': 0.0, 'subscores': {}, 'summary': '', 'raw': f'ERROR: {e}'}
 
         max_workers = min(self.rubric_max_concurrency, num_papers) if num_papers > 0 else 1
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -696,13 +780,13 @@ class RewardManager():
         if not scores:
             # pdb.set_trace()
             print(f"[WARNING] Failed to parse scores from: {score_text[:200]}...")
-            return {'overall': 0.0, 'subscores': {}, 'summary': ''}
+            return {'overall': 0.0, 'subscores': {}, 'summary': '', 'raw': score_text}
         
         # Return average of all dimensions
         avg_score = sum(scores) / len(scores)
         summary_match = re.search(r'Summary:\s*(.*)', score_text, re.IGNORECASE | re.DOTALL)
         summary = summary_match.group(1).strip() if summary_match else ''
-        return {'overall': avg_score, 'subscores': subscores, 'summary': summary}
+        return {'overall': avg_score, 'subscores': subscores, 'summary': summary, 'raw': score_text}
 
 
 

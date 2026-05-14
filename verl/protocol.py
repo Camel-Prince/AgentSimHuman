@@ -538,11 +538,28 @@ class DataProto:
 
     def reorder(self, indices):
         """
-        Note that this operation is in-place
+        Note that this operation is in-place.
+
+        Also reorders any per-sample list in ``meta_info`` whose length matches
+        the original batch size. This keeps downstream consumers that index
+        ``meta_info[key][i]`` in lockstep with ``batch[i]`` after a reorder
+        (e.g. ``_balance_batch`` → reward computation).
         """
+        orig_bsz = self.batch.batch_size[0] if self.batch is not None else None
         indices_np = indices.detach().numpy()
         self.batch = self.batch[indices]
         self.non_tensor_batch = {key: val[indices_np] for key, val in self.non_tensor_batch.items()}
+
+        if self.meta_info and orig_bsz is not None:
+            idx_list = indices_np.tolist()
+            for key, val in list(self.meta_info.items()):
+                if isinstance(val, list) and len(val) == orig_bsz:
+                    # Flat per-sample list, e.g. camera_ready_texts.
+                    self.meta_info[key] = [val[i] for i in idx_list]
+                elif (isinstance(val, list) and len(val) > 0
+                      and all(isinstance(x, list) and len(x) == orig_bsz for x in val)):
+                    # Per-round per-sample list, e.g. paper_writing_draft_texts.
+                    self.meta_info[key] = [[inner[i] for i in idx_list] for inner in val]
 
     def repeat(self, repeat_times=2, interleave=True):
         """

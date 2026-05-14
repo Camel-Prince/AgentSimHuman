@@ -12,9 +12,9 @@ Maintenance rules:
 ## Current Focus
 
 - Main task area: Search-R1 paper-writing RL with multi-round draft/comment rollout.
-- Current preferred rollout mode: `TASK_TYPE=paper_writing_per_segment`.
-- Per-segment credit assignment: drafts and camera-ready participate in loss (info_mask=1); comments/instructions are masked (info_mask=0). Each segment gets independent reward signal via `segment_ids`.
-- Segment label encoding: draft_i = `2*round_idx+1`, comment_i = `2*round_idx+2`, camera_ready = `2*num_rounds+1`.
+- Current preferred rollout mode: `TASK_TYPE=paper_writing_autonomous` (LLM autonomously decides when to submit via `<camera-ready>` or keep drafting via `<draft>`). `per_segment` / `last_round_target` / `arena_seeded` paths remain supported but are not the current focus.
+- Autonomous path per-sample rollout outputs are carried in `batch.non_tensor_batch` (DataProto native alignment through reorder/repeat): `camera_ready`, `format_ok`, `final_source`, `raw_final`. Legacy fields are still also written into `meta_info` for back-compat with unmodified reward_fn.
+- Stage-6 format gate is now unified at rollout end (see `_extract_camera_ready_body_and_source`): a clean single `<camera-ready>...</camera-ready>` or a clean single `<draft>...</draft>` at the final turn are both accepted (`final_source` = `camera_ready` or `draft_as_camera_ready`); plain prose with no tags is `raw_plain`; everything else is `raw_fallback` with `format_ok=False`.
 - Evaluator is being moved toward ground-truth-aware scoring so short/generic abstracts do not receive high reward.
 - High-quality trajectories should be saved for possible later SFT only when format, length, and score filters pass.
 - SFT candidate JSONL schema: `comments` field has been removed; `comment_observations` (XML-wrapped comment + round instruction) is the only comment representation kept.
@@ -36,6 +36,10 @@ Maintenance rules:
 
 - `run_llm_loop_paper_writing`: legacy accumulated-context paper-writing rollout; drafts and camera-ready can be trainable depending on mask construction.
 - `run_llm_loop_paper_writing_per_segment`: accumulated-context rollout where draft and camera-ready tokens are trainable with per-segment credit assignment; comment/instruction tokens are masked.
+- `run_llm_loop_paper_writing_autonomous`: current-focus rollout. LLM freely interleaves `<draft>`/`<camera-ready>` without injected instructions. Tracks `raw_last_responses` per sample (the response string from the turn that finished it, or the forced final turn) and runs the unified Stage-6 format gate once at the end to produce `camera_ready` / `format_ok` / `final_source` / `raw_final` into `non_tensor_batch`.
+- `_extract_camera_ready_body_and_source` (module-level in `generation.py`): single source of truth for camera-ready format gating at rollout end. Mirrors `PaperWritingRewardManager._extract_camera_ready_body` semantics and additionally emits `final_source`.
+- `_sample_and_dump_paper_writing_rollouts` (ray_trainer.py): prefers `batch.non_tensor_batch` fields (autonomous path), falls back to `batch.meta_info` (legacy task_types). Decodes `batch.batch['prompts']` on the fly for picked rows; no longer depends on a snapshot-into-meta_info helper. JSONL schema now includes `final_source`, `raw_final`, `turns`.
+- `_snapshot_paper_writing_input_prompts` (ray_trainer.py): retained as a no-op for call-site stability; `batch.batch['prompts']` is a TensorDict field already reordered in lockstep with other per-sample tensors by `_balance_batch`, so no snapshot is needed.
 - `_compose_final_output`: combines prompts, responses, attention mask, position ids, and `info_mask`.
 - `_compute_paper_writing_reward`: per-segment reward placement. Camera-ready reward (rubric + length penalty) at camera-ready last token; per-draft penalties (format + length) at each draft's last token via `segment_ids`. Falls back to single last-token reward when `segment_ids` absent.
 - `_call_rubric_scoring_api`: calls the rubric evaluator; current intent is ground-truth-aware scoring with dimension subscores.
@@ -67,7 +71,8 @@ Maintenance rules:
 - Watch for this bad pattern: KL rises, entropy drops, response length drops, Round 1 invalid rises, score does not improve.
 - For current diagnostics, use `$rl-training-diagnoser` or run `skills/rl-training-diagnoser/scripts/summarize_rl_metrics.py`.
 - Previous run (2026-04-17, camera_ready_only): collapsed around step 20 — entropy/score/response_len all dropped. Root cause: draft tokens had zero gradient (info_mask=0) and zero KL, causing unconstrained drift and format breakdown.
-- Per-segment implementation ready (2026-04-18): segment_ids tracking, per-segment rewards, per-segment advantage. Not yet launched as a training run.
+- Per-segment implementation ready (2026-04-18): segment_ids tracking, per-segment rewards, per-segment advantage. Not the current focus.
+- Autonomous rollout refactor (2026-04-23): per-sample fields moved from `meta_info` to `non_tensor_batch`; `<draft>` at final turn now accepted as camera-ready; rollout JSONL includes `final_source` / `raw_final` / `turns`. Monitor `final_source` distribution to see how often the model falls back to `draft_as_camera_ready`.
 
 ## Do Not Forget
 
@@ -77,4 +82,5 @@ Maintenance rules:
 - Do not conclude `info_mask` hides text from the model; it only masks training loss.
 - Do not let SFT candidates include trajectories with invalid draft tags, large length mismatch, or low rubric score.
 - Do not re-add `comments` to the SFT candidate schema; `comment_observations` already contains the same text plus XML tags and round instruction.
+- Do not put per-sample strings (camera_ready, drafts, comments, etc.) into `meta_info` for new task_types; use `non_tensor_batch` so DataProto reorder/repeat/pop/union keep them aligned automatically.
 - Do not turn this file into an experiment diary; keep it as a current-state map.

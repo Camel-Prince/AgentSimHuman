@@ -28,6 +28,7 @@ import pdb
 
 import re
 import json
+import random
 from collections import defaultdict
 
 import numpy as np
@@ -453,6 +454,129 @@ class RayPPOTrainer(object):
         task_type = str(getattr(self.config, 'task_type', '') or '')
         return task_type.startswith('paper_writing')
 
+    def _sample_and_dump_paper_writing_rollouts(self, batch: DataProto, out_path: str,
+                                                k: int = 3) -> None:
+        """Sample up to k ok and k format-bad paper-writing rollouts and append to JSONL.
+
+        Prefers per-sample fields from ``batch.non_tensor_batch`` (native DataProto
+        alignment through reorder/repeat). Falls back to legacy ``batch.meta_info``
+        for task_types that still write per-sample lists there (paper_writing,
+        paper_writing_last_round_target, paper_writing_per_segment, …).
+
+        For paper_writing_autonomous, these non_tensor_batch fields are produced
+        by ``run_llm_loop_paper_writing_autonomous``:
+          camera_ready, format_ok, final_source, raw_final.
+        Prompts are decoded on the fly from ``batch.batch['prompts']`` so no
+        meta_info snapshot is required.
+
+        Record schema (JSONL):
+          step, format_ok, final_source, input, drafts, comments,
+          camera_ready, raw_final, rubric, turns.
+        """
+        if not self._is_paper_writing_task():
+            return
+
+        nt = batch.non_tensor_batch or {}
+        meta = batch.meta_info or {}
+
+        # Prefer non_tensor_batch for per-sample fields (autonomous path);
+        # fall back to meta_info (legacy paths).
+        camera_ready_arr = nt.get('camera_ready', None)
+        format_ok_arr = nt.get('format_ok', None)
+        final_source_arr = nt.get('final_source', None)
+        raw_final_arr = nt.get('raw_final', None)
+
+        if camera_ready_arr is not None:
+            batch_size = len(camera_ready_arr)
+            camera_ready_texts = [str(x) for x in camera_ready_arr]
+            format_ok_list = [bool(x) for x in format_ok_arr] if format_ok_arr is not None \
+                else [True] * batch_size
+            final_source_list = [str(x) for x in final_source_arr] if final_source_arr is not None \
+                else [''] * batch_size
+            raw_final_list = [str(x) for x in raw_final_arr] if raw_final_arr is not None \
+                else [''] * batch_size
+        else:
+            camera_ready_texts = meta.get('camera_ready_texts', None)
+            if not camera_ready_texts:
+                return
+            batch_size = len(camera_ready_texts)
+            format_bad = meta.get('paper_writing_format_bad', None)
+            if format_bad is None:
+                _xml_pattern = re.compile(r'<[^>]+>')
+                format_bad = [bool(_xml_pattern.search(t)) for t in camera_ready_texts]
+            format_ok_list = [not bad for bad in format_bad]
+            final_source_list = [''] * batch_size
+            raw_final_list = [''] * batch_size
+
+        rubric_details = meta.get('paper_writing_rubric_details', []) or []
+        draft_texts_by_round = meta.get('paper_writing_draft_texts', []) or []
+        comment_texts_by_round = meta.get('paper_writing_comment_texts', []) or []
+        turns_stats = meta.get('turns_stats', []) or []
+
+        # Decode the (already reorder-aligned) prompts on the fly for the picked
+        # rows only, avoiding the old snapshot-into-meta_info hack.
+        prompts_tensor = batch.batch.get('prompts', None) if batch.batch is not None else None
+
+        ok_indices = [i for i, ok in enumerate(format_ok_list) if ok]
+        bad_indices = [i for i, ok in enumerate(format_ok_list) if not ok]
+        rng = random.Random(self.global_steps)
+        rng.shuffle(ok_indices)
+        rng.shuffle(bad_indices)
+        picked = ok_indices[:k] + bad_indices[:k]
+        if not picked:
+            return
+
+        picked_inputs: Dict[int, str] = {}
+        if prompts_tensor is not None:
+            try:
+                decoded = self.tokenizer.batch_decode(
+                    prompts_tensor[picked], skip_special_tokens=True
+                )
+                for pos, idx in enumerate(picked):
+                    picked_inputs[idx] = decoded[pos]
+            except Exception as exc:
+                print(f"[Paper Writing] Failed to decode prompts for rollout dump: {exc}")
+
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, 'a', encoding='utf-8') as f:
+            for idx in picked:
+                input_text = picked_inputs.get(idx, '')
+                drafts = [
+                    round_texts[idx] if idx < len(round_texts) else ''
+                    for round_texts in draft_texts_by_round
+                ]
+                comments = [
+                    round_texts[idx] if idx < len(round_texts) else ''
+                    for round_texts in comment_texts_by_round
+                ]
+                camera_ready = camera_ready_texts[idx] if idx < len(camera_ready_texts) else ''
+                rubric = rubric_details[idx] if idx < len(rubric_details) else {}
+
+                record = {
+                    'step': int(self.global_steps),
+                    'format_ok': bool(format_ok_list[idx]),
+                    'final_source': final_source_list[idx] if idx < len(final_source_list) else '',
+                    'input': input_text,
+                    'drafts': drafts,
+                    'comments': comments,
+                    'camera_ready': camera_ready,
+                    'raw_final': raw_final_list[idx] if idx < len(raw_final_list) else '',
+                    'rubric': rubric,
+                    'turns': int(turns_stats[idx]) if idx < len(turns_stats) else 0,
+                }
+                f.write(json.dumps(record, ensure_ascii=False) + '\n')
+
+    def _snapshot_paper_writing_input_prompts(self, batch: DataProto) -> None:
+        """Deprecated no-op. Kept for call-site compatibility during refactor.
+
+        The dumper now decodes ``batch.batch['prompts']`` on the fly for the
+        few rows it actually writes; there is no need to snapshot all prompts
+        into ``meta_info`` just to survive ``_balance_batch`` reorder, since
+        ``batch.batch['prompts']`` is a TensorDict field that is reordered in
+        lockstep with every other per-sample tensor.
+        """
+        return
+
     def _run_generation_by_task_type(self, generation_manager: LLMGenerationManager, gen_batch: DataProto,
                                      first_input_ids: torch.Tensor) -> DataProto:
         """Dispatch generation logic by task_type while preserving legacy behavior."""
@@ -560,6 +684,14 @@ class RayPPOTrainer(object):
                 # for certain reward function (e.g. sandbox), the generation can overlap with reward
                 reward_tensor = self.val_reward_fn(test_batch)
 
+                if self.config.trainer.get('save_rollout_samples', True):
+                    self._snapshot_paper_writing_input_prompts(test_batch)
+                    self._sample_and_dump_paper_writing_rollouts(
+                        test_batch,
+                        os.path.join(self.config.trainer.default_local_dir,
+                                     'rollout_samples', 'val.jsonl'),
+                    )
+
                 reward_tensor_lst.append(reward_tensor)
                 data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
         else:
@@ -596,6 +728,14 @@ class RayPPOTrainer(object):
                     # evaluate using reward_function
                     # for certain reward function (e.g. sandbox), the generation can overlap with reward
                     reward_tensor = self.val_reward_fn(test_batch)
+
+                    if self.config.trainer.get('save_rollout_samples', True):
+                        self._snapshot_paper_writing_input_prompts(test_batch)
+                        self._sample_and_dump_paper_writing_rollouts(
+                            test_batch,
+                            os.path.join(self.config.trainer.default_local_dir,
+                                         'rollout_samples', 'val.jsonl'),
+                        )
 
                     reward_tensor_lst.append(reward_tensor)
                     data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
@@ -814,7 +954,16 @@ class RayPPOTrainer(object):
 
                             # Choose generation method based on task type
                             if self._is_paper_writing_task():
-                                # 注入meta info
+                                # 注入 log_prob 相关 meta_info：
+                                # - 仅对在 rollout 循环里"手动"调用 compute_log_prob /
+                                #   compute_ref_log_prob 的 task_type 必须（典型：
+                                #   paper_writing_per_segment，需要对每个 segment 现场算
+                                #   old/ref logprob）。
+                                # - 对走 generate_sequences 一站式路径的 task
+                                #   (paper_writing_autonomous / paper_writing /
+                                #   paper_writing_last_round_target / paper_writing_arena_seeded /
+                                #   Search-R1 run_llm_loop)，worker 会从 self.config.rollout
+                                #   自动注入这些字段，这里的 update 等价于 no-op。
                                 # import pdb
                                 # pdb.set_trace()
                                 gen_batch.meta_info.update({
@@ -870,11 +1019,16 @@ class RayPPOTrainer(object):
                     ####################
                     ####################
 
+                    # Snapshot decoded pre-rollout prompts aligned with meta_info
+                    # BEFORE _balance_batch reorders batch rows. Used by the
+                    # rollout-sample dumper so its fields stay per-sample consistent.
+                    self._snapshot_paper_writing_input_prompts(batch)
+                    os.environ.get('PW_DEBUG') and __import__('pdb').set_trace()
                     # balance the number of valid tokens on each dp rank.
                     # Note that this breaks the order of data inside the batch.
                     # Please take care when you implement group based adv computation such as GRPO and rloo
                     self._balance_batch(batch, metrics=metrics)
-
+                    os.environ.get('PW_DEBUG') and __import__('pdb').set_trace()
                     # compute global_valid tokens
                     batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
 
@@ -896,9 +1050,13 @@ class RayPPOTrainer(object):
                             batch = batch.union(values)
 
                     with _timer('adv', timing_raw):
-                        # compute scores. Support both model and function-based.
-                        # We first compute the scores using reward model. Then, we call reward_fn to combine
-                        # the results from reward model and rule-based results.
+                        # Reward 合成：reward_fn 是最终裁决者。
+                        # - 若 use_rm: 先跑神经 RM，结果写到 batch.batch['rm_scores']，
+                        #   作为给 reward_fn 的"原料"。
+                        # - reward_fn 可选择融合 rm_scores 与规则分 (例 0.7*rm + 0.3*rule)，
+                        #   或完全忽略 rm_scores 只用规则分。
+                        # - 最终只有 batch.batch['token_level_scores'] 进入 advantage 计算，
+                        #   指导策略更新；rm_scores 本身仅是中间原料。
                         if self.use_rm:
                             # we first compute reward model score
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
@@ -912,6 +1070,13 @@ class RayPPOTrainer(object):
                         if hasattr(self.reward_fn, 'paper_writing_metrics') and self.reward_fn.paper_writing_metrics:
                             metrics.update(self.reward_fn.paper_writing_metrics)
                             self.reward_fn.paper_writing_metrics = {}
+
+                        if self.config.trainer.get('save_rollout_samples', True):
+                            self._sample_and_dump_paper_writing_rollouts(
+                                batch,
+                                os.path.join(self.config.trainer.default_local_dir,
+                                             'rollout_samples', 'train.jsonl'),
+                            )
 
                         # compute rewards. apply_kl_penalty if available
                         if not self.config.actor_rollout_ref.actor.use_kl_loss:
@@ -989,5 +1154,5 @@ class RayPPOTrainer(object):
             'state_tokens/total': loss_mask.sum().item(),
             'state_tokens/coverage': (loss_mask.sum() / response_mask.sum()).item(),
         })
-        os.environ.get('PW_DEBUG') and __import__('pdb').set_trace()
+       
         return batch, metrics

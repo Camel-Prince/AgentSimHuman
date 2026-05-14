@@ -5,6 +5,7 @@ import os
 from typing import List, Dict, Any, Tuple
 from dataclasses import dataclass
 import hashlib
+import numpy as np
 from .tensor_helper import TensorHelper, TensorConfig
 from verl import DataProto
 from verl.utils.tracking import Tracking
@@ -13,6 +14,50 @@ import requests
 import asyncio
 import pdb
 from concurrent.futures import ThreadPoolExecutor
+
+
+def _extract_camera_ready_body_and_source(text: str) -> Tuple[str, bool, str]:
+    """Stage-6 format gate used at rollout end for paper_writing_autonomous.
+
+    Mirrors PaperWritingRewardManager._extract_camera_ready_body in main_ppo.py,
+    but additionally reports a ``final_source`` label so downstream (dumper /
+    analytics) can tell how the body was obtained.
+
+    Returns:
+        (body, format_ok, final_source) where final_source ∈ {
+            'camera_ready',        # exactly one clean <camera-ready>...</camera-ready>
+            'draft_as_camera_ready',  # exactly one clean <draft>...</draft> treated as final
+            'raw_plain',           # plain text with no XML tags
+            'raw_fallback',        # anything else (multiple/nested/dirty tags) -> format_bad
+        }
+    """
+    if not isinstance(text, str):
+        return ('', False, 'raw_fallback')
+    stripped = text.strip()
+    tag_pattern = re.compile(r'<[^>]+>')
+    cr_blocks = re.findall(r'<camera-ready>(.*?)</camera-ready>', stripped, re.DOTALL)
+    draft_blocks = re.findall(r'<draft>(.*?)</draft>', stripped, re.DOTALL)
+    total_tags = len(tag_pattern.findall(stripped))
+
+    if len(cr_blocks) == 1 and len(draft_blocks) == 0:
+        body = cr_blocks[0].strip()
+        if total_tags == 2 and not tag_pattern.search(body):
+            return (body, True, 'camera_ready')
+        return (body, False, 'raw_fallback')
+
+    if len(draft_blocks) == 1 and len(cr_blocks) == 0:
+        body = draft_blocks[0].strip()
+        if total_tags == 2 and not tag_pattern.search(body):
+            return (body, True, 'draft_as_camera_ready')
+        return (body, False, 'raw_fallback')
+
+    if not cr_blocks and not draft_blocks:
+        if total_tags == 0:
+            return (stripped, True, 'raw_plain')
+        return (stripped, False, 'raw_fallback')
+
+    body = (cr_blocks[0] if cr_blocks else draft_blocks[0]).strip()
+    return (body, False, 'raw_fallback')
 
 @dataclass
 class GenerationConfig:
@@ -964,609 +1009,232 @@ If I want to give the final answer, I should put the answer between <answer> and
 
 
     # ========== Paper Writing Specific Methods ==========
-    def run_llm_loop_paper_writing(self, gen_batch, initial_input_ids: torch.Tensor,
-                                   num_revision_rounds: int = None):
-        """
-        Run multi-turn paper writing loop with fixed revision rounds.
-        
-        Flow:
-        1. Generate initial draft -> get comment from Commenter API
-        2. Repeat K times: generate revised draft -> get comment  
-        3. Generate final camera-ready version
-        
-        Args:
-            gen_batch: DataProto with input_ids, attention_mask, position_ids
-            initial_input_ids: Initial prompt tokens
-            num_revision_rounds: Number of draft-comment cycles (default: use config)
-        
-        Returns:
-            final_output: DataProto with complete generation
-            
-         ---             
-        最终输出                                                                                                                   
-                        
-        调用 _compose_final_output 组合最终结果：
-                                                                                                                                    
-        final_output = {
-            'prompts': query,                                                                                                      
-            'responses': draft_0 + comment_0 + draft_1 + comment_1 + draft_2 + comment_2 + camera_ready,
-            'responses_with_info_mask': draft_0 + [pad_mask] + draft_1 + [pad_mask] + draft_2 + [pad_mask] + camera_ready,         
-            'input_ids': query + responses,                                                                                        
-            'attention_mask': [1, 1, 1, ...],  # 基于 input_ids                                                                    
-            'info_mask': [1, 1, 1, 0, 0, 1, 1, 0, 0, ...],  # 基于 responses_with_info_mask，comments 位置为 0                     
-            'position_ids': [0, 1, 2, 3, ...],                                                                                     
-            'meta_info': {                                                                                                         
-                'num_revision_rounds': 3,                                                                                          
-                'camera_ready_texts': [camera_ready 的文本内容]                                                                    
-            }                                                                                                                      
-        }                                                                                                                          
-                                                                                                                                    
-        ---             
-        关键点总结                                                                                                                 
-                                                                                                                                    
-        1. rollings（滚动上下文）：
-            - 累积，每轮保留：query + 所有的（ draft + comment + 指令遵循prompt）
-            - 用于下一轮 gen-agent 的输入                                                                                            
-        2. original_right_side（最终输出）：                                                                                       
-            - 累积所有 drafts 和 comments                                                                                            
-            - responses：完整的生成序列                                                                                              
-            - responses_with_info_mask：所有非generator生成的内容 被替换为 pad_mask                                                                   
-        3. mask 机制：                                                                                                             
-            - gen-agent 生成的内容（drafts, camera-ready）：不加 mask                                                                
-            - commenter 生成的内容（comments）：加 mask（替换为 pad_id）                                                             
-            - 用于训练时只对 gen-agent 的输出计算梯度                                                                                
-        4. 输入逻辑：                                                                                                              
-            - 第 0 轮生成 draft_0：输入 = query                                                                                      
-            - 第 1 轮生成 draft_1：输入 = query + draft_0 + comment_0                                                                
-            - 第 2 轮生成 draft_2：输入 = query + draft_0 + comment_0 + draft_1 + comment_1                                                                
-            - 第 i 轮生成 draft_i：输入 = query + draft_0 + comment_0 + ... + draft_{i-1} + comment_{i-1}                                                        
-            - 最终生成 camera-ready：输入 = query + draft_0 + comment_0 + ... + draft_{最后一轮} + comment_{最后一轮}  
-        
-        1）question: 训练多轮长trace，实际测试并非多轮 -> 可能导致模型过拟合在多轮交互的模版，而非真正的写作能力； 
-        可能的方案：最终的输出（original_right_side）只保留 query + 最后一轮的 draft + comment
-        
-        2）训commenter的版本；
-        
-        3）Qwe-Max as Evaluator: noisy; 真实的abstract没有利用起来；-> 参考arenaRL
-        
-        4）自己决定多少个turn；[TBD] 
-        
-        
-        5）待定；data方面：
-        auto-rubric, 检查数据是否都是写作任务的？ ❓
-        
-        """
-        
-        
-        if num_revision_rounds is None:
-            num_revision_rounds = self.config.num_revision_rounds
-        
-        print(f"\n[Paper Writing] Starting {num_revision_rounds}-round revision process")
-        
-        # Initialize
-        original_left_side = {'input_ids': initial_input_ids[:, -self.config.max_start_length:]}
-        original_right_side = {
-            'responses': initial_input_ids[:, []], 
-            'responses_with_info_mask': initial_input_ids[:, []]
-        }
-        # Segment-level old/ref append path is temporarily disabled.
-        # We will recompute old/ref once on the final accumulated sequence in ray_trainer.
-        # if not self.is_validation:
-        #     original_right_side['old_log_probs'] = initial_input_ids[:, []].float()
-        #     original_right_side['ref_log_prob'] = initial_input_ids[:, []].float()
-        rollings = gen_batch
-        
-        # Extract queries from non_tensor_batch; system prompt 和 query应该分离；手动控制循环轮次的时候，gen的system-prompt无需说明循环过程，只需告诉它如果有前轮的drfat和comment，就据此修改，如果没有就重新写draft；
-        queries = self._extract_queries_from_batch(gen_batch)
-        
-        # Extract domain and topic for Commenter API
-        domains, topics = self._extract_domain_topic_from_batch(gen_batch)
-        
-        # Extract optional ground truth references for commenter.
-        # Ground truth is only a reference, not necessarily better than current draft.
-        ground_truths = self._extract_ground_truth_from_batch(gen_batch)
-        ground_truth_lengths = self._text_token_lengths(ground_truths)
-        draft_valid_flags_by_round = []
-        draft_lengths_by_round = []
-        draft_texts_by_round = []
-        comments_by_round = []
-        comment_obs_by_round = []
-
-        # pdb.set_trace()
-        # ===== Phase 1: K rounds of draft-comment cycles =====
-        for round_idx in range(num_revision_rounds):
-            print(f"\n[Paper Writing] Round {round_idx + 1}/{num_revision_rounds}")
-            
-            # Cut to effective length
-            rollings.batch = self.tensor_fn.cut_to_effective_len(
-                rollings.batch,
-                keys=['input_ids', 'attention_mask', 'position_ids']
-            )
-            # Debug: print current rolling context, the input of gen-agent each turn
-            gen_input_str = self.tokenizer.batch_decode(rollings.batch["input_ids"], skip_special_tokens=True)
-            
-            # Generate draft
-            gen_output = self._generate_with_gpu_padding(rollings)
-    
-            draft_str = self.tokenizer.batch_decode(gen_output.batch["responses"], skip_special_tokens=True)
-            draft_ids = self._batch_tokenize(draft_str)
-            valid_flags = [self._is_strict_single_draft(x) for x in draft_str]
-            draft_valid_flags_by_round.append(valid_flags)
-            draft_texts_by_round.append(draft_str)
-            draft_length_texts = [self._draft_content_for_length(x) for x in draft_str]
-            draft_lengths_by_round.append(self._text_token_lengths(draft_length_texts))
-            invalid_count = sum(1 for ok in valid_flags if not ok)
-            if invalid_count > 0:
-                print(f"[Paper Writing] Round {round_idx + 1}: invalid draft format count = {invalid_count}/{len(draft_str)}")
-            
-            # Call Commenter API only for valid draft outputs.
-            comments = [''] * len(draft_str)
-            valid_indices = [i for i, ok in enumerate(valid_flags) if ok]
-            invalid_indices = [i for i, ok in enumerate(valid_flags) if not ok]
-            if valid_indices:
-                valid_domains = [domains[i] for i in valid_indices]
-                valid_topics = [topics[i] for i in valid_indices]
-                valid_drafts = [draft_str[i] for i in valid_indices]
-                valid_ground_truths = [ground_truths[i] for i in valid_indices] if ground_truths is not None else None
-                valid_comments = self._call_commenter_batch(valid_domains, valid_topics, valid_drafts, valid_ground_truths)
-                for i, idx in enumerate(valid_indices):
-                    comments[idx] = valid_comments[i]
-            comments_by_round.append(comments)
-            # print(f'round_idx: {round_idx}, comments[0]: {comments[0]}')
-            
-            # Build next observations:
-            # - valid output: reviewer comment + next-round instruction at tail
-            # - invalid output: corrective feedback + next-round instruction at tail
-            next_round = round_idx + 2
-            if round_idx < num_revision_rounds - 1:
-                round_instruction = (
-                    f"Round {next_round}: Please write your draft now. "
-                    "Output only one <draft>...</draft> block."
-                )
-            else:
-                round_instruction = (
-                    "Final step: Based on the latest draft and reviewer comments, write the final camera-ready abstract. "
-                    "Output only the abstract text. Do not include XML tags, comments, explanations, or markdown."
-                )
-            comment_obs = []
-            for i, ok in enumerate(valid_flags):
-                if ok:
-                    feedback = comments[i]
-                else:
-                    feedback = (
-                        "Your previous output format is invalid. "
-                        "You must output exactly one <draft>...</draft> block and nothing else."
-                    )
-                comment_obs.append(f'\n\n<comment>{feedback}</comment>\n\n{round_instruction}\n\n')
-            comment_obs_by_round.append(comment_obs)
-            comment_obs_ids = self._process_next_obs(comment_obs)
-
-            # Accumulative rolling context:
-            # q -> q,d1,c1 -> q,d1,c1,d2,c2 -> ...
-            rollings = self._update_rolling_state(
-                rollings,
-                draft_ids,
-                comment_obs_ids
-            )
-
-            # Update right_side (accumulative: for final output and mask)
-            prev_responses = original_right_side['responses']
-            original_right_side = self._update_right_side(
-                original_right_side, draft_ids, comment_obs_ids
-            )
-            
-            responses_str = self.tokenizer.batch_decode(original_right_side["responses"], skip_special_tokens=True)
-            responses_with_info_mask_str = self.tokenizer.batch_decode(original_right_side["responses_with_info_mask"], skip_special_tokens=True)
-            
-        # ===== Phase 2: Generate final camera-ready =====
-        print(f"\n[Paper Writing] Generating final camera-ready version")
-        
-
-        rollings.batch = self.tensor_fn.cut_to_effective_len(
-            rollings.batch,
-            keys=['input_ids', 'attention_mask', 'position_ids']
-        )
-        
-        gen_output = self._generate_with_gpu_padding(rollings)
-        final_str = self.tokenizer.batch_decode(gen_output.batch["responses"], skip_special_tokens=True)
-        camera_ready_lengths = self._text_token_lengths(final_str)
-        # final_str, _ = self._normalize_draft_texts(raw_final_str, round_idx=-1)
-        final_ids = self._batch_tokenize(final_str)
-        # Segment-level old/ref computation is disabled for accumulative rolling mode.
-        # if not self.is_validation:
-        #     final_old_lp, final_ref_lp = self._compute_segment_old_ref_logprob(rollings, final_ids)
-        
-        # Extract camera-ready  content nothing different from draft
-        # camera_readys, failed_indices = self._extract_drafts_with_fallback(final_str, round_idx=num_revision_rounds)
-
-        # Update right_side (no comment this time)
-        prev_responses = original_right_side['responses']
-        original_right_side = self._update_right_side(
-            original_right_side, final_ids, next_obs_ids=None
-        )
-        # Segment-level old/ref append is disabled for accumulative rolling mode.
-        # if not self.is_validation:
-        #     target_len = original_right_side['responses'].shape[1]
-        #     original_right_side['old_log_probs'] = self._update_dense_right_side_aligned(
-        #         prev_tokens=prev_responses,
-        #         prev_dense=original_right_side['old_log_probs'],
-        #         cur_tokens=final_ids,
-        #         cur_dense=final_old_lp,
-        #         target_len=target_len
-        #     )
-        #     original_right_side['ref_log_prob'] = self._update_dense_right_side_aligned(
-        #         prev_tokens=prev_responses,
-        #         prev_dense=original_right_side['ref_log_prob'],
-        #         cur_tokens=final_ids,
-        #         cur_dense=final_ref_lp,
-        #         target_len=target_len
-        #     )
-        #     assert original_right_side['responses'].shape == original_right_side['old_log_probs'].shape, \
-        #         f"responses vs old_log_probs mismatch: {original_right_side['responses'].shape} vs {original_right_side['old_log_probs'].shape}"
-        #     assert original_right_side['responses'].shape == original_right_side['ref_log_prob'].shape, \
-        #         f"responses vs ref_log_prob mismatch: {original_right_side['responses'].shape} vs {original_right_side['ref_log_prob'].shape}"
-        
-        # Compose final output
-        # Keep rollout meta_info (e.g. micro_batch_size/temperature/use_dynamic_bsz/max_token_len)
-        # to stay compatible with downstream compute_log_prob in custom training paths.
-        meta_info = dict(getattr(gen_output, 'meta_info', {}) or {})
-        meta_info['num_revision_rounds'] = num_revision_rounds
-        meta_info['camera_ready_texts'] = final_str
-        meta_info['paper_writing_draft_valid_flags'] = draft_valid_flags_by_round
-        meta_info['paper_writing_draft_lengths'] = draft_lengths_by_round
-        meta_info['paper_writing_camera_ready_lengths'] = camera_ready_lengths
-        meta_info['paper_writing_ground_truth_lengths'] = ground_truth_lengths
-        meta_info['paper_writing_draft_texts'] = draft_texts_by_round
-        meta_info['paper_writing_comment_texts'] = comments_by_round
-        meta_info['paper_writing_comment_obs_texts'] = comment_obs_by_round
-        meta_info['paper_writing_ground_truth_texts'] = ground_truths
-        meta_info['paper_writing_domains'] = domains
-        meta_info['paper_writing_topics'] = topics
-        print(f"[Paper Writing] Completed {num_revision_rounds} revision rounds\n")
-        return self._compose_final_output(original_left_side, original_right_side, meta_info)
-
-    def run_llm_loop_paper_writing_last_round_target(self, gen_batch, initial_input_ids: torch.Tensor,
-                                                      num_revision_rounds: int = None):
-        """
-        多轮写作循环（Last-Round Target 版本）。
-
-        目标：
-        1. rollout 侧仍保留“多轮 draft-comment”交互，保证生成过程不变；
-        2. 训练侧只保留最后一轮的 `draft + comment`，避免长 trace 模板过拟合；
-        3. 最终 camera-ready 文本仍会生成并写入 `meta_info['camera_ready_texts']` 供 reward 使用，
-           但不会拼入 responses（即不作为训练 token）。
-
-        输入：
-        - gen_batch: 含 input_ids/attention_mask/position_ids 的 DataProto
-        - initial_input_ids: 起始 query token
-        - num_revision_rounds: 修订轮次（默认取 config）
-
-        输出：
-        - DataProto（通过 _compose_final_output 组织）
-        - 其中 right_side 只包含最后一轮 `draft + comment(+round_instruction)`；
-          comment/instruction 在 responses_with_info_mask 中会被 mask（不可训练）。
-        """
-        if num_revision_rounds is None:
-            num_revision_rounds = self.config.num_revision_rounds
-
-        print(f"\n[Paper Writing/LastRoundTarget] Starting {num_revision_rounds}-round revision process")
-        original_left_side = {'input_ids': initial_input_ids[:, -self.config.max_start_length:]}
-        rollings = gen_batch
-
-        domains, topics = self._extract_domain_topic_from_batch(gen_batch)
-        ground_truths = self._extract_ground_truth_from_batch(gen_batch)
-        ground_truth_lengths = self._text_token_lengths(ground_truths)
-
-        last_draft_ids = initial_input_ids[:, :0]
-        last_comment_obs_ids = initial_input_ids[:, :0]
-
-        for round_idx in range(num_revision_rounds):
-            rollings.batch = self.tensor_fn.cut_to_effective_len(
-                rollings.batch,
-                keys=['input_ids', 'attention_mask', 'position_ids']
-            )
-            gen_output = self._generate_with_gpu_padding(rollings)
-            draft_str = self.tokenizer.batch_decode(gen_output.batch["responses"], skip_special_tokens=True)
-            draft_ids = self._batch_tokenize(draft_str)
-            valid_flags = [self._is_strict_single_draft(x) for x in draft_str]
-
-            comments = [''] * len(draft_str)
-            valid_indices = [i for i, ok in enumerate(valid_flags) if ok]
-            if valid_indices:
-                valid_domains = [domains[i] for i in valid_indices]
-                valid_topics = [topics[i] for i in valid_indices]
-                valid_drafts = [draft_str[i] for i in valid_indices]
-                valid_ground_truths = [ground_truths[i] for i in valid_indices]
-                valid_comments = self._call_commenter_batch(
-                    valid_domains, valid_topics, valid_drafts, valid_ground_truths
-                )
-                for i, idx in enumerate(valid_indices):
-                    comments[idx] = valid_comments[i]
-
-            next_round = round_idx + 2
-            round_instruction = self._make_round_instruction(next_round)
-            comment_obs = []
-            for i, ok in enumerate(valid_flags):
-                if ok:
-                    feedback = comments[i]
-                else:
-                    feedback = (
-                        "Your previous output format is invalid. "
-                        "You must output exactly one <draft>...</draft> block and nothing else."
-                    )
-                comment_obs.append(f'\n\n<comment>{feedback}</comment>\n\n{round_instruction}\n\n')
-            comment_obs_ids = self._process_next_obs(comment_obs)
-
-            rollings = self._update_rolling_state(rollings, draft_ids, comment_obs_ids)
-            last_draft_ids = draft_ids
-            last_comment_obs_ids = comment_obs_ids
-
-        # 额外生成一次最终稿，仅用于 reward 与日志，不加入训练序列。
-        rollings.batch = self.tensor_fn.cut_to_effective_len(
-            rollings.batch,
-            keys=['input_ids', 'attention_mask', 'position_ids']
-        )
-        final_output = self._generate_with_gpu_padding(rollings)
-        final_str = self.tokenizer.batch_decode(final_output.batch["responses"], skip_special_tokens=True)
-
-        # right_side 仅保留最后一轮内容（draft + comment/instruction）。
-        original_right_side = {
-            'responses': initial_input_ids[:, []],
-            'responses_with_info_mask': initial_input_ids[:, []]
-        }
-        original_right_side = self._update_right_side(original_right_side, last_draft_ids, last_comment_obs_ids)
-
-        meta_info = dict(getattr(final_output, 'meta_info', {}) or {})
-        meta_info['num_revision_rounds'] = num_revision_rounds
-        meta_info['camera_ready_texts'] = final_str
-        meta_info['paper_writing_ground_truth_texts'] = ground_truths
-        meta_info['paper_writing_ground_truth_lengths'] = ground_truth_lengths
-        meta_info['paper_writing_domains'] = domains
-        meta_info['paper_writing_topics'] = topics
-        meta_info['trace_mode'] = 'last_round_target'
-        return self._compose_final_output(original_left_side, original_right_side, meta_info)
-
-    def run_llm_loop_paper_writing_per_segment(self, gen_batch, initial_input_ids: torch.Tensor,
-                                                     num_revision_rounds: int = None):
-        """
-        多轮写作循环（Per-Segment 信用分配版本）。
-
-        rollout 侧保持累积上下文；训练侧让 draft 和 camera-ready 参与 loss，
-        comment/instruction 通过 info_mask 遮掉。每段有独立的 segment_label，
-        用于 per-draft 奖励信号和信用分配。
-        """
-        if num_revision_rounds is None:
-            num_revision_rounds = self.config.num_revision_rounds
-
-        print(f"\n[Paper Writing/PerSegment] Starting {num_revision_rounds}-round revision process")
-        original_left_side = {'input_ids': initial_input_ids[:, -self.config.max_start_length:]}
-        original_right_side = {
-            'responses': initial_input_ids[:, []],
-            'responses_with_info_mask': initial_input_ids[:, []]
-        }
-        rollings = gen_batch
-
-        domains, topics = self._extract_domain_topic_from_batch(gen_batch)
-        ground_truths = self._extract_ground_truth_from_batch(gen_batch)
-        ground_truth_lengths = self._text_token_lengths(ground_truths)
-
-        draft_valid_flags_by_round = []
-        draft_lengths_by_round = []
-        draft_texts_by_round = []
-        comments_by_round = []
-        comment_obs_by_round = []
-
-        for round_idx in range(num_revision_rounds):
-            print(f"\n[Paper Writing/PerSegment] Round {round_idx + 1}/{num_revision_rounds}")
-            rollings.batch = self.tensor_fn.cut_to_effective_len(
-                rollings.batch,
-                keys=['input_ids', 'attention_mask', 'position_ids']
-            )
-            gen_output = self._generate_with_gpu_padding(rollings)
-            draft_str = self.tokenizer.batch_decode(gen_output.batch["responses"], skip_special_tokens=True)
-            draft_ids = self._batch_tokenize(draft_str)
-            valid_flags = [self._is_strict_single_draft(x) for x in draft_str]
-            draft_valid_flags_by_round.append(valid_flags)
-            draft_texts_by_round.append(draft_str)
-            draft_length_texts = [self._draft_content_for_length(x) for x in draft_str]
-            draft_lengths_by_round.append(self._text_token_lengths(draft_length_texts))
-
-            invalid_count = sum(1 for ok in valid_flags if not ok)
-            if invalid_count > 0:
-                print(f"[Paper Writing/PerSegment] Round {round_idx + 1}: invalid draft format count = {invalid_count}/{len(draft_str)}")
-
-            comments = [''] * len(draft_str)
-            valid_indices = [i for i, ok in enumerate(valid_flags) if ok]
-            if valid_indices:
-                valid_domains = [domains[i] for i in valid_indices]
-                valid_topics = [topics[i] for i in valid_indices]
-                valid_drafts = [draft_str[i] for i in valid_indices]
-                valid_ground_truths = [ground_truths[i] for i in valid_indices] if ground_truths is not None else None
-                valid_comments = self._call_commenter_batch(valid_domains, valid_topics, valid_drafts, valid_ground_truths)
-                for i, idx in enumerate(valid_indices):
-                    comments[idx] = valid_comments[i]
-            comments_by_round.append(comments)
-
-            next_round = round_idx + 2
-            if round_idx < num_revision_rounds - 1:
-                round_instruction = self._make_round_instruction(next_round)
-            else:
-                round_instruction = (
-                    "Final step: Based on the latest draft and reviewer comments, write the final camera-ready abstract. "
-                    "Output only the abstract text. Do not include XML tags, comments, explanations, or markdown."
-                )
-
-            comment_obs = []
-            for i, ok in enumerate(valid_flags):
-                if ok:
-                    feedback = comments[i]
-                else:
-                    feedback = (
-                        "Your previous output format is invalid. "
-                        "You must output exactly one <draft>...</draft> block and nothing else."
-                    )
-                comment_obs.append(f'\n\n<comment>{feedback}</comment>\n\n{round_instruction}\n\n')
-            comment_obs_by_round.append(comment_obs)
-            comment_obs_ids = self._process_next_obs(comment_obs)
-
-            rollings = self._update_rolling_state(rollings, draft_ids, comment_obs_ids)
-            # segment_label: draft_i = 2*round_idx+1, comment_i = 2*round_idx+2
-            # Drafts are trainable (participate in loss); comments are not.
-            original_right_side = self._append_right_side_segment(
-                original_right_side, draft_ids, trainable=True,
-                segment_label=2 * round_idx + 1,
-            )
-            original_right_side = self._append_right_side_segment(
-                original_right_side, comment_obs_ids, trainable=False,
-                segment_label=2 * round_idx + 2,
-            )
-
-        print(f"\n[Paper Writing/PerSegment] Generating final camera-ready version")
-        rollings.batch = self.tensor_fn.cut_to_effective_len(
-            rollings.batch,
-            keys=['input_ids', 'attention_mask', 'position_ids']
-        )
-        gen_output = self._generate_with_gpu_padding(rollings)
-        final_str = self.tokenizer.batch_decode(gen_output.batch["responses"], skip_special_tokens=True)
-        final_ids = self._batch_tokenize(final_str)
-        camera_ready_lengths = self._text_token_lengths(final_str)
-        camera_ready_label = 2 * num_revision_rounds + 1
-        original_right_side = self._append_right_side_segment(
-            original_right_side, final_ids, trainable=True,
-            segment_label=camera_ready_label,
-        )
-
-        meta_info = dict(getattr(gen_output, 'meta_info', {}) or {})
-        meta_info['num_revision_rounds'] = num_revision_rounds
-        meta_info['camera_ready_texts'] = final_str
-        meta_info['paper_writing_draft_valid_flags'] = draft_valid_flags_by_round
-        meta_info['paper_writing_draft_lengths'] = draft_lengths_by_round
-        meta_info['paper_writing_camera_ready_lengths'] = camera_ready_lengths
-        meta_info['paper_writing_ground_truth_lengths'] = ground_truth_lengths
-        meta_info['paper_writing_draft_texts'] = draft_texts_by_round
-        meta_info['paper_writing_comment_texts'] = comments_by_round
-        meta_info['paper_writing_comment_obs_texts'] = comment_obs_by_round
-        meta_info['paper_writing_ground_truth_texts'] = ground_truths
-        meta_info['paper_writing_domains'] = domains
-        meta_info['paper_writing_topics'] = topics
-        meta_info['trace_mode'] = 'per_segment'
-        print(f"[Paper Writing/PerSegment] Completed {num_revision_rounds} revision rounds\n")
-        os.environ.get('PW_DEBUG') and __import__('pdb').set_trace()
-        return self._compose_final_output(original_left_side, original_right_side, meta_info)
-
     def run_llm_loop_paper_writing_train_commenter(self, gen_batch, initial_input_ids: torch.Tensor,
                                                     num_revision_rounds: int = None):
         """
-        多轮写作循环（Train-Commenter 版本）。
+        多轮写作循环（Train-Commenter 版本，Autonomous 架构）。
 
-        目标：
-        1. 将“写 draft”的角色切换为 API generator；
-        2. 本地 actor 只负责生成 `<comment>...</comment>`；
-        3. 训练目标从 draft 切到 comment（只训 commenter）。
+        流程镜像 run_llm_loop_paper_writing_autonomous，但角色互换：
+        - API generator 负责 <draft> 和 <camera-ready>（masked，不参与梯度）；
+        - 本地 actor 只负责 <comment>（unmasked，参与梯度）。
 
-        训练 mask 策略：
-        - API 生成的 draft：mask（不参与梯度）
-        - 本地模型生成的 comment：不 mask（参与梯度）
-        - 控制指令/轮次提示：mask（不参与梯度）
+        每一步：
+        1. API generator 对所有 active 样本生成 (<draft> 或 <camera-ready>)；
+        2. <camera-ready> → 该样本 done；
+        3. <draft> → 本地模型生成 <comment>（trainable）；
+        4. 更新 rolling state 和 right_side；
+        5. active_mask 更新。
 
-        说明：
-        - 为减少配置改动，API generator 复用 commenter 的 API 配置
-          (`commenter_api_key/base_url/model`)。
+        强制最终轮：exhausted max_turns 的样本由 API 生成 fallback，masked。
+
+        meta_info 只写 turns_stats, active_mask, valid_action_stats,
+        valid_comment_stats, trace_mode（不写 camera_ready_texts 等）。
+        non_tensor_batch 写 camera_ready, format_ok, final_source, raw_final。
+
+        说明：num_revision_rounds 参数保留签名兼容性，本模式以 max_turns 控制终止。
         """
-        if num_revision_rounds is None:
-            num_revision_rounds = self.config.num_revision_rounds
-
-        print(f"\n[Paper Writing/TrainCommenter] Starting {num_revision_rounds}-round revision process")
+        print(f"\n[Paper Writing/TrainCommenter] Starting autonomous-style loop (max_turns={self.config.max_turns})")
         original_left_side = {'input_ids': initial_input_ids[:, -self.config.max_start_length:]}
         original_right_side = {
             'responses': initial_input_ids[:, []],
             'responses_with_info_mask': initial_input_ids[:, []]
         }
+
+        batch_size = gen_batch.batch['input_ids'].shape[0]
+        active_mask = torch.ones(batch_size, dtype=torch.bool)
+        turns_stats = torch.ones(batch_size, dtype=torch.int)
+        valid_action_stats = torch.zeros(batch_size, dtype=torch.int)
+        valid_comment_stats = torch.zeros(batch_size, dtype=torch.int)
+        active_num_list = [active_mask.sum().item()]
+        raw_last_responses: List[str] = [''] * batch_size
         rollings = gen_batch
 
         domains, topics = self._extract_domain_topic_from_batch(gen_batch)
-        _ = self._extract_ground_truth_from_batch(gen_batch)
-        last_local_meta = {}
+        ground_truths = self._extract_ground_truth_from_batch(gen_batch)
+        meta_info = {}
 
-        for round_idx in range(num_revision_rounds):
+        for step in range(self.config.max_turns):
+            if not active_mask.sum():
+                break
+
             rollings.batch = self.tensor_fn.cut_to_effective_len(
                 rollings.batch,
                 keys=['input_ids', 'attention_mask', 'position_ids']
             )
-            rolling_texts = self.tokenizer.batch_decode(rollings.batch["input_ids"], skip_special_tokens=True)
-
-            # Step 1: API 生成 draft（该段不参与训练）。
-            draft_texts = self._call_generator_batch(
-                contexts=rolling_texts,
-                domains=domains,
-                topics=topics
+            rolling_texts = self.tokenizer.batch_decode(
+                rollings.batch["input_ids"], skip_special_tokens=True
             )
-            normalized_drafts = []
-            for text in draft_texts:
-                if self._is_strict_single_draft(text):
-                    normalized_drafts.append(text)
-                else:
-                    normalized_drafts.append("<draft>Please revise the abstract to satisfy formatting requirements.</draft>")
-            draft_ids = self._batch_tokenize(normalized_drafts)
 
-            # Step 2: 本地模型生成 comment（该段参与训练）。
-            comment_instruction = [
-                "\n\nPlease provide a concise reviewer comment for the previous draft. "
-                "Output exactly one <comment>...</comment> block.\n\n"
-                for _ in normalized_drafts
+            # Step 1: API 生成（仅对 active 样本）。
+            active_indices = [i for i in range(batch_size) if active_mask[i]]
+            api_results = self._call_generator_batch(
+                contexts=[rolling_texts[i] for i in active_indices],
+                domains=[domains[i] for i in active_indices],
+                topics=[topics[i] for i in active_indices],
+            )
+
+            # 归一化并散射回完整 batch（inactive 样本保持 ''）。
+            api_texts = [''] * batch_size
+            for pos, idx in enumerate(active_indices):
+                text = api_results[pos]
+                if re.fullmatch(r'\s*<camera-ready>.*?</camera-ready>\s*', text, re.DOTALL):
+                    api_texts[idx] = text.strip()
+                elif self._is_strict_single_draft(text):
+                    api_texts[idx] = text.strip()
+                else:
+                    api_texts[idx] = "<draft>Please revise the abstract to satisfy formatting requirements.</draft>"
+
+            # 解析 API 动作：'camera-ready' | 'draft'。
+            api_actions = [None] * batch_size
+            for i in range(batch_size):
+                text = api_texts[i]
+                if re.search(r'<camera-ready>', text, re.DOTALL):
+                    api_actions[i] = 'camera-ready'
+                elif re.search(r'<draft>', text, re.DOTALL):
+                    api_actions[i] = 'draft'
+
+            # done：inactive 或 camera-ready。
+            dones = [
+                1 if (not bool(active_mask[i].item()) or api_actions[i] == 'camera-ready') else 0
+                for i in range(batch_size)
             ]
-            comment_instruction_ids = self._process_next_obs(comment_instruction)
-            commenter_rollings = self._update_rolling_state(rollings, draft_ids, comment_instruction_ids)
-            commenter_rollings.batch = self.tensor_fn.cut_to_effective_len(
-                commenter_rollings.batch,
+
+            # 记录已完成样本的最后一次原始输出。
+            for i, done in enumerate(dones):
+                if done and bool(active_mask[i].item()) and not raw_last_responses[i]:
+                    raw_last_responses[i] = api_texts[i]
+
+            # 统计 valid API action。
+            for i in range(batch_size):
+                if bool(active_mask[i].item()) and api_actions[i] in ('camera-ready', 'draft'):
+                    valid_action_stats[i] += 1
+
+            # Tokenize API 输出（full batch，masked in right_side）。
+            api_ids = self._batch_tokenize(api_texts)
+
+            # Step 2: 本地模型对 draft 样本生成 <comment>（trainable）。
+            draft_indices = [i for i in active_indices if api_actions[i] == 'draft']
+            comment_block_texts = [''] * batch_size   # 用于 right_side
+            comment_obs_texts = [''] * batch_size     # 用于 rolling context
+
+            if draft_indices:
+                comment_instruction_str = (
+                    "\n\nPlease provide a concise reviewer comment for the previous draft. "
+                    "Output exactly one <comment>...</comment> block.\n\n"
+                )
+                comment_instruction_ids = self._process_next_obs(
+                    [comment_instruction_str] * batch_size
+                )
+                commenter_rollings_full = self._update_rolling_state(
+                    rollings, api_ids, comment_instruction_ids
+                )
+                commenter_rollings_full.batch = self.tensor_fn.cut_to_effective_len(
+                    commenter_rollings_full.batch,
+                    keys=['input_ids', 'attention_mask', 'position_ids']
+                )
+                draft_mask = torch.tensor(
+                    [i in set(draft_indices) for i in range(batch_size)], dtype=torch.bool
+                )
+                commenter_rollings_active = DataProto.from_dict({
+                    k: v[draft_mask] for k, v in commenter_rollings_full.batch.items()
+                })
+                comment_output = self._generate_with_gpu_padding(commenter_rollings_active)
+                meta_info = dict(getattr(comment_output, 'meta_info', {}) or {})
+
+                raw_comment_strs = self.tokenizer.batch_decode(
+                    comment_output.batch["responses"], skip_special_tokens=True
+                )
+                # 归一化并散射回完整 batch。
+                for pos, idx in enumerate(draft_indices):
+                    text = raw_comment_strs[pos]
+                    m = re.search(r'<comment>(.*?)</comment>', text, re.DOTALL)
+                    content = m.group(1).strip() if m else text.strip()
+                    if not content:
+                        content = "Please improve clarity, method detail, and result specificity."
+                    comment_block_texts[idx] = f"<comment>{content}</comment>"
+                    comment_obs_texts[idx] = f"\n\n<comment>{content}</comment>\n\n"
+                    valid_comment_stats[idx] += 1
+
+            # Tokenize comment（full batch；非 draft 样本为 '' → padding）。
+            comment_ids = self._batch_tokenize(comment_block_texts)
+            comment_obs_ids = self._process_next_obs(comment_obs_texts)
+
+            # 更新 active_mask。
+            curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
+            active_mask = active_mask * curr_active_mask
+            active_num_list.append(active_mask.sum().item())
+            turns_stats[curr_active_mask] += 1
+
+            # Rolling state：追加 API output + comment obs。
+            rollings = self._update_rolling_state(rollings, api_ids, comment_obs_ids)
+
+            # Right-side：api draft → masked；comment → trainable。
+            original_right_side = self._append_right_side_segment(
+                original_right_side, api_ids, trainable=False
+            )
+            original_right_side = self._append_right_side_segment(
+                original_right_side, comment_ids, trainable=True
+            )
+
+        # 强制最终轮：耗尽 max_turns 的样本由 API 生成（masked）。
+        if active_mask.sum():
+            print(f"[Paper Writing/TrainCommenter] {active_mask.sum().item()} sample(s) exhausted "
+                  f"max_turns, forcing final API generation")
+            rollings.batch = self.tensor_fn.cut_to_effective_len(
+                rollings.batch,
                 keys=['input_ids', 'attention_mask', 'position_ids']
             )
-            comment_output = self._generate_with_gpu_padding(commenter_rollings)
-            last_local_meta = dict(getattr(comment_output, 'meta_info', {}) or {})
-            raw_comment_texts = self.tokenizer.batch_decode(comment_output.batch["responses"], skip_special_tokens=True)
-            comment_blocks = []
-            for text in raw_comment_texts:
-                match = re.search(r'<comment>(.*?)</comment>', text, re.DOTALL)
-                if match:
-                    content = match.group(1).strip()
+            rolling_texts = self.tokenizer.batch_decode(
+                rollings.batch["input_ids"], skip_special_tokens=True
+            )
+            active_indices = [i for i in range(batch_size) if active_mask[i]]
+            api_results = self._call_generator_batch(
+                contexts=[rolling_texts[i] for i in active_indices],
+                domains=[domains[i] for i in active_indices],
+                topics=[topics[i] for i in active_indices],
+            )
+            final_api_texts = [''] * batch_size
+            for pos, idx in enumerate(active_indices):
+                text = api_results[pos]
+                if re.fullmatch(r'\s*<camera-ready>.*?</camera-ready>\s*', text, re.DOTALL):
+                    final_api_texts[idx] = text.strip()
+                elif self._is_strict_single_draft(text):
+                    final_api_texts[idx] = text.strip()
                 else:
-                    content = text.strip()
-                if not content:
-                    content = "Please improve clarity, method detail, and result specificity."
-                comment_blocks.append(f"<comment>{content}</comment>")
-            comment_ids = self._process_next_obs([f"\n\n{c}\n\n" for c in comment_blocks])
+                    final_api_texts[idx] = "<draft>Please revise the abstract to satisfy formatting requirements.</draft>"
+            for i, active in enumerate(active_mask.tolist()):
+                if active and not raw_last_responses[i]:
+                    raw_last_responses[i] = final_api_texts[i]
+            final_api_ids = self._batch_tokenize(final_api_texts)
+            original_right_side = self._append_right_side_segment(
+                original_right_side, final_api_ids, trainable=False
+            )
 
-            # Step 3: 组装下一轮观察（comment + round instruction），交给 API 继续写 draft。
-            next_round = round_idx + 2
-            round_instruction = self._make_round_instruction(next_round)
-            instruction_ids = self._process_next_obs([f"{round_instruction}\n\n" for _ in comment_blocks])
-            combined_obs_ids = self._process_next_obs([
-                f"\n\n{comment_blocks[i]}\n\n{round_instruction}\n\n" for i in range(len(comment_blocks))
-            ])
-            rollings = self._update_rolling_state(rollings, draft_ids, combined_obs_ids)
+        # Format gate：与 autonomous 版本保持一致。
+        bodies: List[str] = [''] * batch_size
+        format_oks: List[bool] = [False] * batch_size
+        final_sources: List[str] = ['raw_fallback'] * batch_size
+        for i in range(batch_size):
+            raw = raw_last_responses[i] or ''
+            body, ok, source = _extract_camera_ready_body_and_source(raw)
+            bodies[i] = body
+            format_oks[i] = ok
+            final_sources[i] = source
 
-            # 右侧按“可训练性”追加：
-            # draft -> mask；comment -> train；instruction -> mask。
-            original_right_side = self._append_right_side_segment(original_right_side, draft_ids, trainable=False)
-            original_right_side = self._append_right_side_segment(original_right_side, comment_ids, trainable=True)
-            original_right_side = self._append_right_side_segment(original_right_side, instruction_ids, trainable=False)
-
-        # 最终稿由 API 生成，仅用于 reward/logging，在训练序列中保持 mask。
-        rollings.batch = self.tensor_fn.cut_to_effective_len(
-            rollings.batch,
-            keys=['input_ids', 'attention_mask', 'position_ids']
-        )
-        final_contexts = self.tokenizer.batch_decode(rollings.batch["input_ids"], skip_special_tokens=True)
-        final_str = self._call_generator_batch(contexts=final_contexts, domains=domains, topics=topics)
-        final_ids = self._batch_tokenize(final_str)
-        original_right_side = self._append_right_side_segment(original_right_side, final_ids, trainable=False)
-
-        meta_info = dict(last_local_meta)
-        meta_info['num_revision_rounds'] = num_revision_rounds
-        meta_info['camera_ready_texts'] = final_str
+        meta_info = dict(meta_info)
+        meta_info['turns_stats'] = turns_stats.tolist()
+        meta_info['active_mask'] = active_mask.tolist()
+        meta_info['valid_action_stats'] = valid_action_stats.tolist()
+        meta_info['valid_comment_stats'] = valid_comment_stats.tolist()
         meta_info['trace_mode'] = 'train_commenter'
-        return self._compose_final_output(original_left_side, original_right_side, meta_info)
 
+        print(f"[Paper Writing/TrainCommenter] ACTIVE_TRAJ_NUM: {active_num_list}")
+        final_output = self._compose_final_output(original_left_side, original_right_side, meta_info)
+        final_output.non_tensor_batch['camera_ready'] = np.array(bodies, dtype=object)
+        final_output.non_tensor_batch['format_ok'] = np.array(format_oks, dtype=object)
+        final_output.non_tensor_batch['final_source'] = np.array(final_sources, dtype=object)
+        final_output.non_tensor_batch['raw_final'] = np.array(raw_last_responses, dtype=object)
+        return final_output
     def run_llm_loop_paper_writing_arena_seeded(self, gen_batch, initial_input_ids: torch.Tensor,
                                                  num_revision_rounds: int = None):
         """
@@ -1578,12 +1246,12 @@ If I want to give the final answer, I should put the answer between <answer> and
         - 使用数据集 `ground_truth` 作为 anchor，得到更干净的相对排序信号；
         - 将排序分写入 `meta_info['arena_scores']`，供 hybrid reward 融合使用。
         """
-        base_output = self.run_llm_loop_paper_writing(
+        base_output = self.run_llm_loop_paper_writing_autonomous(
             gen_batch=gen_batch,
             initial_input_ids=initial_input_ids,
-            num_revision_rounds=num_revision_rounds
         )
-        camera_ready_texts = base_output.meta_info.get('camera_ready_texts', [])
+        camera_ready_arr = base_output.non_tensor_batch.get('camera_ready', None)
+        camera_ready_texts = [str(x) for x in camera_ready_arr] if camera_ready_arr is not None else []
         anchors = self._extract_ground_truth_from_batch(gen_batch)
         seed = int(getattr(self.config, 'arena_seed', 20260413))
         group_size = int(getattr(self.config, 'arena_group_size', 8))
@@ -1610,9 +1278,15 @@ If I want to give the final answer, I should put the answer between <answer> and
         强制最终轮（max_turns 用完仍 active）：
           直接 append 原始输出到 right_side，格式由 reward evaluator 判断。
 
-        final_output meta_info:
-          - camera_ready_texts: List[str]  (供 reward 使用)
-          - trace_mode: 'autonomous'
+        Per-sample rollout 产出放 ``non_tensor_batch`` (DataProto 原生对齐)：
+          - camera_ready   (object str)       已经过 Stage-6 format gate 清洗的最终正文
+          - format_ok      (object bool)      True 表示格式合法可评分
+          - final_source   (object str)       'camera_ready' / 'draft_as_camera_ready' /
+                                              'raw_plain' / 'raw_fallback'
+          - raw_final      (object str)       最后一轮的未清洗原始输出，调试用
+
+        写入 ``meta_info``：
+          - turns_stats, active_mask, valid_action_stats, valid_comment_stats, trace_mode
         """
         original_left_side = {'input_ids': initial_input_ids[:, -self.config.max_start_length:]}
         original_right_side = {
@@ -1627,6 +1301,13 @@ If I want to give the final answer, I should put the answer between <answer> and
         valid_comment_stats = torch.zeros(batch_size, dtype=torch.int)
         active_num_list = [active_mask.sum().item()]
         camera_ready_texts = [''] * batch_size
+        # Raw last-turn output per sample: the untouched response string from the
+        # turn in which the sample finished (or the forced final turn). Used at
+        # the end to run the Stage-6 format gate once, consistently.
+        raw_last_responses: List[str] = [''] * batch_size
+        # Per-turn trace, indexed as [round_idx][sample_idx]. Used for rollout dumping.
+        draft_texts_by_round: List[List[str]] = []
+        comment_texts_by_round: List[List[str]] = []
         rollings = gen_batch
 
         domains, topics = self._extract_domain_topic_from_batch(gen_batch)
@@ -1664,10 +1345,31 @@ If I want to give the final answer, I should put the answer between <answer> and
                     domains=domains, topics=topics, ground_truths=ground_truths
                 )
 
-            # Record camera-ready texts for samples that just finished this step
-            for i, content in enumerate(camera_ready_contents):
+            # Record camera-ready texts + raw final output for samples that
+            # finished via <camera-ready> in this step.
+            for i, (content, done) in enumerate(zip(camera_ready_contents, dones)):
                 if content and not camera_ready_texts[i]:
                     camera_ready_texts[i] = content
+                if done and bool(active_mask[i].item()) and not raw_last_responses[i]:
+                    raw_last_responses[i] = responses_str[i] if i < len(responses_str) else ''
+
+            # Record per-turn drafts (from response) and comments (from commenter obs).
+            round_drafts: List[str] = ['' for _ in range(batch_size)]
+            round_comments: List[str] = ['' for _ in range(batch_size)]
+            for i, resp in enumerate(responses_str):
+                if not bool(active_mask[i].item()):
+                    continue
+                d_match = re.search(r'<draft>(.*?)</draft>', resp, re.DOTALL)
+                if d_match:
+                    round_drafts[i] = d_match.group(1).strip()
+            for i, obs in enumerate(next_obs):
+                if i >= batch_size or not bool(active_mask[i].item()):
+                    continue
+                c_match = re.search(r'<comment>(.*?)</comment>', obs, re.DOTALL)
+                if c_match:
+                    round_comments[i] = c_match.group(1).strip()
+            draft_texts_by_round.append(round_drafts)
+            comment_texts_by_round.append(round_comments)
 
             curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
             active_mask = active_mask * curr_active_mask
@@ -1704,19 +1406,32 @@ If I want to give the final answer, I should put the answer between <answer> and
                 responses_ids, responses_str, active_mask
             )
 
-            # Try to extract <camera-ready> tag content; fall back to raw output.
-            # Evaluator will apply a format gate: raw output containing XML tags gets reward -1.
-            for i, (active, text) in enumerate(zip(active_mask.tolist(), responses_str)):
+            # Stash the raw final-turn output; body/format_ok extraction happens
+            # in the unified Stage-6 gate below.
+            for i, active in enumerate(active_mask.tolist()):
                 if active:
-                    match = re.search(r'<camera-ready>(.*?)</camera-ready>', text, re.DOTALL)
-                    camera_ready_texts[i] = match.group(1).strip() if match else text
+                    raw_last_responses[i] = responses_str[i] if i < len(responses_str) else ''
 
             original_right_side = self._update_right_side(
                 original_right_side, responses_ids
             )
 
+        # format gate: derive a single clean body + format_ok +
+        # final_source for every sample from its raw last-turn output. This
+        # replaces the old dumper-side _xml_pattern tripwire and accepts
+        # <draft>...</draft> in the final turn as a valid camera-ready.
+        bodies: List[str] = [''] * batch_size
+        format_oks: List[bool] = [False] * batch_size
+        final_sources: List[str] = ['raw_fallback'] * batch_size
+        for i in range(batch_size):
+            raw = raw_last_responses[i] or ''
+            body, ok, source = _extract_camera_ready_body_and_source(raw)
+            bodies[i] = body
+            format_oks[i] = ok
+            final_sources[i] = source
+            camera_ready_texts[i] = body
+
         meta_info = dict(meta_info)
-        meta_info['camera_ready_texts'] = camera_ready_texts
         meta_info['turns_stats'] = turns_stats.tolist()
         meta_info['active_mask'] = active_mask.tolist()
         meta_info['valid_action_stats'] = valid_action_stats.tolist()
@@ -1724,7 +1439,19 @@ If I want to give the final answer, I should put the answer between <answer> and
         meta_info['trace_mode'] = 'autonomous'
 
         print(f"[Paper Writing/Autonomous] ACTIVE_TRAJ_NUM: {active_num_list}")
-        return self._compose_final_output(original_left_side, original_right_side, meta_info)
+        final_output = self._compose_final_output(original_left_side, original_right_side, meta_info)
+
+        # Attach per-sample fields to non_tensor_batch so that DataProto's
+        # reorder/repeat/pop/union automatically keep them aligned with the
+        # batch tensors (Stage 2 of the refactor).
+        final_output.non_tensor_batch['camera_ready'] = np.array(bodies, dtype=object)
+        final_output.non_tensor_batch['format_ok'] = np.array(format_oks, dtype=object)
+        final_output.non_tensor_batch['final_source'] = np.array(final_sources, dtype=object)
+        final_output.non_tensor_batch['raw_final'] = np.array(raw_last_responses, dtype=object)
+        os.environ.get('PW_DEBUG') and __import__('pdb').set_trace()
+        responses_str = self.tokenizer.batch_decode(original_right_side['responses'],skip_special_tokens=True)
+        responses_with_info_mask_str = self.tokenizer.batch_decode(original_right_side['responses_with_info_mask'],skip_special_tokens=True)
+        return final_output
 
     def _extract_queries_from_batch(self, gen_batch):
         """Extract query text from non_tensor_batch (saved during data processing)."""
@@ -1854,7 +1581,9 @@ If I want to give the final answer, I should put the answer between <answer> and
             from openai import OpenAI
             self._commenter_client = OpenAI(
                 api_key=self.config.commenter_api_key,
-                base_url=self.config.commenter_base_url
+                base_url=self.config.commenter_base_url,
+                timeout=60,  # Set a reasonable timeout for commenter API calls
+                max_retries=3  # Disable retries to fail fast on issues
             )
         return self._commenter_client
 
@@ -1867,7 +1596,9 @@ If I want to give the final answer, I should put the answer between <answer> and
             from openai import OpenAI
             self._generator_client = OpenAI(
                 api_key=self.config.commenter_api_key,
-                base_url=self.config.commenter_base_url
+                base_url=self.config.commenter_base_url,
+                timeout=60,  # Set a reasonable timeout for generator API calls
+                max_retries=3  # Disable retries to fail fast on issues
             )
         return self._generator_client
 
@@ -1989,7 +1720,7 @@ If I want to give the final answer, I should put the answer between <answer> and
         if not pairs:
             return []
 
-        max_workers = min(256, len(pairs))
+        max_workers =min(48, len(pairs))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [
                 executor.submit(

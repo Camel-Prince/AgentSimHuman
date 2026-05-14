@@ -104,11 +104,35 @@ def gpu_worker(gpu_id,
         time.sleep(random.uniform(0.0, 0.2))
 
 
+def parse_gpu_ids(value: str):
+    """Parse a comma-separated list of GPU ids, e.g. '0,1,2,3'."""
+    if value is None:
+        return []
+    items = [x.strip() for x in value.split(",") if x.strip() != ""]
+    return [int(x) for x in items]
+
+
 if __name__ == "__main__":
-    gpu_ids = [3,4,5,6]
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Occupy GPUs with synthetic workload.")
+    parser.add_argument(
+        "--gpus",
+        "--gpu_ids",
+        dest="gpus",
+        type=parse_gpu_ids,
+        default=[6, 7],
+        help="Comma-separated GPU ids, e.g. --gpus=0,1,2,3,4",
+    )
+    args = parser.parse_args()
+
+    gpu_ids = args.gpus
+    if not gpu_ids:
+        raise SystemExit("No GPU ids provided. Use --gpus=0,1,...")
+
+    print(f"[main] Launching workers on GPUs: {gpu_ids}")
 
     processes = []
-
     for gid in gpu_ids:
         p = mp.Process(target=gpu_worker, args=(gid,))
         p.start()

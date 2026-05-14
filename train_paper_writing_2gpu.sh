@@ -1,5 +1,5 @@
 # 可外部覆盖；默认使用两张卡
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-5,6}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1,2}
 export DATA_DIR='data_paper_writing/processed'
 
 # 缓解 FSDP backward 的显存碎片，避免 reserved-but-unallocated 导致 OOM
@@ -10,12 +10,12 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:Tr
 # 2) 若当前 http_proxy/https_proxy 仍是失效的 ofey 代理 (10.128.208.19)，
 #    自动切回本机 clash (127.0.0.1:17890)
 unset ALL_PROXY all_proxy
-if [[ -z "$http_proxy" || "$http_proxy" == *"10.128.208.19"* ]]; then
-    export http_proxy="http://127.0.0.1:17890"
-    export https_proxy="http://127.0.0.1:17890"
-    export HTTP_PROXY="$http_proxy"
-    export HTTPS_PROXY="$https_proxy"
-fi
+# if [[ -z "$http_proxy" || "$http_proxy" == *"10.128.208.19"* ]]; then
+#     export http_proxy="http://127.0.0.1:17890"
+#     export https_proxy="http://127.0.0.1:17890"
+#     export HTTP_PROXY="$http_proxy"
+#     export HTTPS_PROXY="$https_proxy"
+# fi
 echo "[INFO] Proxy: http_proxy=$http_proxy https_proxy=$https_proxy"
 
 # 并发运行配置：
@@ -47,7 +47,7 @@ echo "[INFO] RUN_ID=${RUN_ID}"
 echo "[INFO] Ray config: GCS_PORT=${RAY_GCS_SERVER_PORT}, DASHBOARD_PORT=${RAY_DASHBOARD_PORT}, TMPDIR=${RAY_TMPDIR}"
 
 # API Key 配置 (保持不变)
-export COMMENTER_API_KEY="sk-b870c071cce248ab825a9c213779cd68"
+export COMMENTER_API_KEY="sk-c19178e6b0054b94ba68fa80c25e54bf"
 export COMMENTER_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
 export COMMENTER_MODEL="qwen-plus"
 export RUBRIC_API_KEY="sk-b870c071cce248ab825a9c213779cd68"
@@ -55,7 +55,7 @@ export RUBRIC_API_BASE="https://dashscope.aliyuncs.com/compatible-mode/v1"
 export RUBRIC_MODEL="qwen-max"
 
 WAND_PROJECT='Search-R1-PaperWriting'
-export BASE_MODEL='/home/wangzixu/.cache/modelscope/hub/models/Qwen/Qwen2___5-3B-Instruct'
+export BASE_MODEL="${MODELSCOPE_CACHE:-/data1/wangzixu/.cache/modelscope}/hub/models/Qwen/Qwen2___5-3B-Instruct"
 # warm cktp 是一个已经能够较好遵守format的模型
 # WARM_CKPT_ROOT=/home/wangzixu/Search-R1/verl_checkpoints/paper-writing-grpo-qwen2_5-3B-instruct-arxiv-writing-20260408_000243                                                                                               
 # export BASE_MODEL=${WARM_CKPT_ROOT}/actor/global_step_20
@@ -71,16 +71,16 @@ LOG_PROB_MICRO_BATCH_SIZE=8
 
 # GRPO-like, KL as loss
 KL_LOSS=true
-KL_LOSS_COEF=0.001
+KL_LOSS_COEF=0.000
 
 # PPO-like, KL correct the score to get reward;
 # the critic/kl_coeff in wandb
-KL_COEF=0.005
+KL_COEF=0.000
 GROUP_SIZE=8
 
 # 选择 rollout 路径:
-# paper_writing / paper_writing_per_segment / paper_writing_last_round_target / paper_writing_train_commenter / paper_writing_arena_seeded
-TASK_TYPE=${TASK_TYPE:-paper_writing}
+# paper_writing_autonomous /paper_writing / paper_writing_per_segment / paper_writing_last_round_target / paper_writing_train_commenter / paper_writing_arena_seeded
+TASK_TYPE=${TASK_TYPE:-paper_writing_autonomous}
 # 选择 reward 路径:
 # paper_writing / paper_writing_arena_hybrid
 REWARD_TYPE=${REWARD_TYPE:-paper_writing}
@@ -156,12 +156,12 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=4096 \
     actor_rollout_ref.ref.fsdp_config.param_offload=true \
     algorithm.no_think_rl=false \
-    trainer.logger=['console','wandb'] \
+    trainer.logger=['console'] \
     +trainer.val_before_train=false \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
-    trainer.save_freq=20 \
-    trainer.test_freq=10 \
+    trainer.save_freq=10 \
+    trainer.test_freq=-1 \
     trainer.total_epochs=15 \
     trainer.project_name=$WAND_PROJECT \
     trainer.experiment_name=$EXPERIMENT_NAME \
