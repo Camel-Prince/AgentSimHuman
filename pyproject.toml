@@ -36,6 +36,7 @@ dependencies = [
     "dill",
     "hydra-core",
     "numpy",
+    "openai",
     "pybind11",
     "ray",
     "tensordict",

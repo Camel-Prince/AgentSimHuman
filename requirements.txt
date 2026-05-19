@@ -5,6 +5,7 @@ dill
 flash-attn
 hydra-core
 numpy
+openai
 pandas
 pybind11
 ray
