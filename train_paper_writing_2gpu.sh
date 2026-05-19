@@ -46,13 +46,13 @@ mkdir -p "${RAY_TMPDIR}"
 echo "[INFO] RUN_ID=${RUN_ID}"
 echo "[INFO] Ray config: GCS_PORT=${RAY_GCS_SERVER_PORT}, DASHBOARD_PORT=${RAY_DASHBOARD_PORT}, TMPDIR=${RAY_TMPDIR}"
 
-# API Key 配置 (保持不变)
-export COMMENTER_API_KEY="sk-c19178e6b0054b94ba68fa80c25e54bf"
-export COMMENTER_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
-export COMMENTER_MODEL="qwen-plus"
-export RUBRIC_API_KEY="sk-b870c071cce248ab825a9c213779cd68"
-export RUBRIC_API_BASE="https://dashscope.aliyuncs.com/compatible-mode/v1"
-export RUBRIC_MODEL="qwen-max"
+# API Key 配置（从 ~/.bashrc 等系统环境变量读取，避免泄漏到 GitHub）
+export COMMENTER_API_KEY="${COMMENTER_API_KEY:-}"
+export COMMENTER_BASE_URL="${COMMENTER_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}"
+export COMMENTER_MODEL="${COMMENTER_MODEL:-qwen-plus}"
+export RUBRIC_API_KEY="${RUBRIC_API_KEY:-}"
+export RUBRIC_API_BASE="${RUBRIC_API_BASE:-https://dashscope.aliyuncs.com/compatible-mode/v1}"
+export RUBRIC_MODEL="${RUBRIC_MODEL:-qwen-max}"
 
 WAND_PROJECT='Search-R1-PaperWriting'
 export BASE_MODEL="${MODELSCOPE_CACHE:-/data1/wangzixu/.cache/modelscope}/hub/models/Qwen/Qwen2___5-3B-Instruct"

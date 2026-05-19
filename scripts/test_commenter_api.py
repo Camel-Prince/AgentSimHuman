@@ -29,7 +29,11 @@ from urllib.parse import urlparse
 for _var in ("ALL_PROXY", "all_proxy"):
     os.environ.pop(_var, None)
 
-API_KEY = os.environ.get("COMMENTER_API_KEY", "sk-b870c071cce248ab825a9c213779cd68")
+API_KEY = os.environ.get("COMMENTER_API_KEY")
+if not API_KEY:
+    print("ERROR: COMMENTER_API_KEY environment variable is not set.", file=sys.stderr)
+    print("Please source ~/.bashrc or export it before running this script.", file=sys.stderr)
+    sys.exit(1)
 BASE_URL = os.environ.get(
     "COMMENTER_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
 )
