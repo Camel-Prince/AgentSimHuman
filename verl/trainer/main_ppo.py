@@ -27,6 +27,8 @@ import openai
 import pdb
 import json
 import os
+import threading
+import time
 
 
 def _select_rm_score_fn(data_source):
@@ -34,6 +36,29 @@ def _select_rm_score_fn(data_source):
         return qa_em.compute_score_em
     else:
         raise NotImplementedError
+
+
+class _SimpleRateLimiter:
+    """线程安全的滑动窗口 RPM 限流器（独立版，避免跨文件依赖）。"""
+
+    def __init__(self, rpm: int = 120):
+        self.rpm = max(1, rpm)
+        self._lock = threading.Lock()
+        self._timestamps: list[float] = []
+
+    def acquire(self):
+        with self._lock:
+            now = time.monotonic()
+            cutoff = now - 60.0
+            self._timestamps = [t for t in self._timestamps if t > cutoff]
+            if len(self._timestamps) >= self.rpm:
+                wait = self._timestamps[0] - cutoff
+                if wait > 0:
+                    time.sleep(wait)
+                now = time.monotonic()
+                cutoff = now - 60.0
+                self._timestamps = [t for t in self._timestamps if t > cutoff]
+            self._timestamps.append(now)
 
 
 class RewardManager():
@@ -44,6 +69,7 @@ class RewardManager():
                  reward_type='paper_writing',
                  rubric_api_key=None, rubric_api_base=None, rubric_model='qwen-max',
                  rubric_max_concurrency=32,
+                 rubric_rpm=120,
                  arena_weight=0.7,
                  rubric_weight=0.3,
                  experiment_name='default',
@@ -59,6 +85,8 @@ class RewardManager():
         self.rubric_model = rubric_model
         # Max concurrent rubric API calls; configurable via Hydra config.
         self.rubric_max_concurrency = rubric_max_concurrency
+        self.rubric_rpm = rubric_rpm
+        self._rubric_rate_limiter = _SimpleRateLimiter(rpm=rubric_rpm)
         self.arena_weight = arena_weight
         self.rubric_weight = rubric_weight
         self.experiment_name = experiment_name
@@ -704,6 +732,7 @@ class RewardManager():
                     {"role": "user", "content": user_content}
                 ]
 
+                self._rubric_rate_limiter.acquire()
                 response = client.chat.completions.create(
                     model=self.rubric_model,
                     messages=messages,
@@ -892,6 +921,7 @@ def main_task(config):
         rubric_api_base=config.get('rubric_api_base'),
         rubric_model=config.get('rubric_model', 'qwen-max'),
         rubric_max_concurrency=config.get('rubric_max_concurrency', 32),
+        rubric_rpm=config.get('rubric_rpm', 120),
         arena_weight=config.get('arena_weight', 0.7),
         rubric_weight=config.get('rubric_weight', 0.3),
         experiment_name=config.trainer.get('experiment_name', 'default'),
@@ -909,6 +939,7 @@ def main_task(config):
         rubric_api_base=config.get('rubric_api_base'),
         rubric_model=config.get('rubric_model', 'qwen-max'),
         rubric_max_concurrency=config.get('rubric_max_concurrency', 32),
+        rubric_rpm=config.get('rubric_rpm', 120),
         arena_weight=config.get('arena_weight', 0.7),
         rubric_weight=config.get('rubric_weight', 0.3),
         experiment_name=config.trainer.get('experiment_name', 'default'),

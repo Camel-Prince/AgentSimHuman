@@ -13,6 +13,8 @@ import shutil
 import requests
 import asyncio
 import pdb
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 
@@ -59,6 +61,31 @@ def _extract_camera_ready_body_and_source(text: str) -> Tuple[str, bool, str]:
     body = (cr_blocks[0] if cr_blocks else draft_blocks[0]).strip()
     return (body, False, 'raw_fallback')
 
+
+class RateLimiter:
+    """线程安全的滑动窗口 RPM 限流器。"""
+
+    def __init__(self, rpm: int = 120):
+        self.rpm = max(1, rpm)
+        self._lock = threading.Lock()
+        self._timestamps: list[float] = []
+
+    def acquire(self):
+        """阻塞直到 60s 窗口内有可用配额。"""
+        with self._lock:
+            now = time.monotonic()
+            cutoff = now - 60.0
+            self._timestamps = [t for t in self._timestamps if t > cutoff]
+            if len(self._timestamps) >= self.rpm:
+                wait = self._timestamps[0] - cutoff
+                if wait > 0:
+                    time.sleep(wait)
+                now = time.monotonic()
+                cutoff = now - 60.0
+                self._timestamps = [t for t in self._timestamps if t > cutoff]
+            self._timestamps.append(now)
+
+
 @dataclass
 class GenerationConfig:
     max_turns: int
@@ -76,6 +103,8 @@ class GenerationConfig:
     commenter_base_url: str = None
     commenter_model: str = "qwen-plus"
     generator_max_concurrency: int = 64
+    commenter_max_concurrency: int = 48
+    api_rpm: int = 120
     arena_seed_mode: str = "swiss_single_round"
     arena_seed: int = 20260413
     arena_group_size: int = 8
@@ -96,6 +125,7 @@ class LLMGenerationManager:
         self.is_validation = is_validation
         self._commenter_client = None
         self._generator_client = None
+        self._commenter_rate_limiter = RateLimiter(rpm=getattr(config, 'api_rpm', 120))
 
         self.tensor_fn = TensorHelper(TensorConfig(
             pad_token_id=tokenizer.pad_token_id,
@@ -1676,6 +1706,7 @@ If I want to give the final answer, I should put the answer between <answer> and
         ]
 
         try:
+            self._commenter_rate_limiter.acquire()
             resp = client.chat.completions.create(
                 model=self.config.commenter_model,
                 messages=messages,
@@ -1720,7 +1751,7 @@ If I want to give the final answer, I should put the answer between <answer> and
         if not pairs:
             return []
 
-        max_workers =min(48, len(pairs))
+        max_workers = min(max(1, int(getattr(self.config, 'commenter_max_concurrency', 48))), len(pairs))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [
                 executor.submit(

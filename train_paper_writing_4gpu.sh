@@ -60,6 +60,10 @@ REWARD_TYPE=paper_writing
 NUM_REVISION_ROUNDS=3
 # API generator 并发（仅在 paper_writing_train_commenter 中使用）
 GENERATOR_MAX_CONCURRENCY=64
+# API 速率限制（RPM），commenter 和 rubric 共用
+API_RPM=${API_RPM:-120}
+COMMENTER_MAX_CONCURRENCY=${COMMENTER_MAX_CONCURRENCY:-48}
+RUBRIC_RPM=${RUBRIC_RPM:-120}
 # Arena Swiss 单轮排序配置（仅在 paper_writing_arena_seeded + arena_hybrid 奖励下生效）
 ARENA_SEED_MODE=swiss_single_round
 ARENA_SEED=20260413
@@ -132,6 +136,9 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     +reward_type=$REWARD_TYPE \
     +num_revision_rounds=$NUM_REVISION_ROUNDS \
     +generator_max_concurrency=$GENERATOR_MAX_CONCURRENCY \
+    +api_rpm=$API_RPM \
+    +commenter_max_concurrency=$COMMENTER_MAX_CONCURRENCY \
+    +rubric_rpm=$RUBRIC_RPM \
     +arena_seed_mode=$ARENA_SEED_MODE \
     +arena_seed=$ARENA_SEED \
     +arena_group_size=$ARENA_GROUP_SIZE \
