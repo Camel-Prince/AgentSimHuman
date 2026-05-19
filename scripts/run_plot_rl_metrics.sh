@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-LOG_PATH_DEFAULT="/home/wangzixu/Search-R1/paper-writing-grpo-qwen2_5-3B-instruct-arxiv-writing.log"
+LOG_PATH_DEFAULT="/home/wangzixu/Search-R1/logs/paper-writing-grpo-qwen2_5-3B-instruct-arxiv-writing-20260416_234503-run0.log"
 OUT_DIR_DEFAULT="/home/wangzixu/Search-R1/monitor_outputs"
 
 LOG_PATH="${1:-$LOG_PATH_DEFAULT}"
