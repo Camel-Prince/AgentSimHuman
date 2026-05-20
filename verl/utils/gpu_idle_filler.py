@@ -62,8 +62,14 @@ class GPUIdleFiller:
                 pass
         return [0]
 
-    def start(self):
-        """Launch agent_SAS.py subprocess. No-op if disabled or already running."""
+    def start(self, wait_ready_timeout: float = 5.0):
+        """Launch agent_SAS.py subprocess. No-op if disabled or already running.
+
+        Args:
+            wait_ready_timeout: Seconds to wait for the subprocess to allocate
+                GPU memory before returning. If the subprocess exits early, its
+                stderr is printed for diagnosis.
+        """
         if not self.enabled:
             return
         if self._proc is not None and self._proc.poll() is None:
@@ -73,38 +79,67 @@ class GPUIdleFiller:
             return
         gpus_str = ','.join(str(g) for g in self._gpu_ids)
         cmd = [sys.executable, self.agent_sas_path, '--gpus', gpus_str]
+
+        # Pipe stderr so we can read crash messages instead of silently losing them.
         try:
             self._proc = subprocess.Popen(
                 cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
             )
-            print(f'[GPUIdleFiller] started (pid={self._proc.pid}, gpus={gpus_str})')
         except Exception as e:
             print(f'[GPUIdleFiller] failed to start: {e}')
             self._proc = None
+            return
+
+        pid = self._proc.pid
+        print(f'[GPUIdleFiller] launched (pid={pid}, gpus={gpus_str}), waiting up to {wait_ready_timeout}s …')
+
+        # Give the subprocess time to allocate memory; check for quick death.
+        import time as _time
+        deadline = _time.monotonic() + wait_ready_timeout
+        while _time.monotonic() < deadline:
+            ret = self._proc.poll()
+            if ret is not None:
+                # Subprocess exited immediately — something went wrong.
+                stderr = self._proc.stderr.read()
+                self._proc = None
+                print(f'[GPUIdleFiller] SUBPROCESS EXITED with code {ret} during startup!')
+                if stderr:
+                    print(f'[GPUIdleFiller] stderr:\n{stderr}')
+                return
+            _time.sleep(0.5)
+
+        print(f'[GPUIdleFiller] ready (pid={pid}, gpus={gpus_str})')
 
     def stop(self):
         """Terminate agent_SAS subprocess and wait for full exit. No-op if not running."""
         if self._proc is None:
             return
-        if self._proc.poll() is not None:
-            # Already exited
-            self._proc = None
-            return
         pid = self._proc.pid
-        try:
-            self._proc.terminate()
+        already_done = self._proc.poll() is not None
+
+        if not already_done:
             try:
-                self._proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
-                self._proc.wait()
+                self._proc.terminate()
+                try:
+                    self._proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
+                    self._proc.wait()
+            except Exception as e:
+                print(f'[GPUIdleFiller] error during stop (pid={pid}): {e}')
+
+        # Close pipes to avoid leaked file descriptors.
+        if self._proc.stdout:
+            self._proc.stdout.close()
+        if self._proc.stderr:
+            self._proc.stderr.close()
+
+        if not already_done:
             print(f'[GPUIdleFiller] stopped (pid={pid})')
-        except Exception as e:
-            print(f'[GPUIdleFiller] error during stop: {e}')
-        finally:
-            self._proc = None
+        self._proc = None
 
     def __enter__(self):
         self.start()
