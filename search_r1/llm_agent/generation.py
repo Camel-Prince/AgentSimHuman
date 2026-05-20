@@ -108,6 +108,9 @@ class GenerationConfig:
     arena_seed_mode: str = "swiss_single_round"
     arena_seed: int = 20260413
     arena_group_size: int = 8
+    # GPU idle filler configs
+    gpu_filler_enabled: bool = True
+    gpu_filler_gpu_ids: list = None
 
 class LLMGenerationManager:
     def __init__(
@@ -126,6 +129,15 @@ class LLMGenerationManager:
         self._commenter_client = None
         self._generator_client = None
         self._commenter_rate_limiter = RateLimiter(rpm=getattr(config, 'api_rpm', 120))
+
+        from verl.utils.gpu_idle_filler import GPUIdleFiller
+        from pathlib import Path
+        _agent_sas_path = Path(__file__).parent.parent.parent / 'agent_SAS.py'
+        self._gpu_filler = GPUIdleFiller(
+            agent_sas_path=str(_agent_sas_path),
+            gpu_ids=getattr(config, 'gpu_filler_gpu_ids', None),
+            enabled=getattr(config, 'gpu_filler_enabled', True),
+        )
 
         self.tensor_fn = TensorHelper(TensorConfig(
             pad_token_id=tokenizer.pad_token_id,
@@ -1671,12 +1683,13 @@ If I want to give the final answer, I should put the answer between <answer> and
         client = self._get_generator_client()
         pairs = list(zip(contexts, domains, topics))
         max_workers = min(max(1, int(self.config.generator_max_concurrency)), len(pairs))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [
-                executor.submit(self._call_generator_single, client, context, domain, topic)
-                for context, domain, topic in pairs
-            ]
-            return [f.result() for f in futures]
+        with self._gpu_filler:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(self._call_generator_single, client, context, domain, topic)
+                    for context, domain, topic in pairs
+                ]
+                return [f.result() for f in futures]
 
     def _call_commenter_single(self, client, system_prompt, domain, topic, draft, ground_truth=''):
         """Call Commenter API for a single sample (sync)."""
@@ -1752,19 +1765,20 @@ If I want to give the final answer, I should put the answer between <answer> and
             return []
 
         max_workers = min(max(1, int(getattr(self.config, 'commenter_max_concurrency', 48))), len(pairs))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [
-                executor.submit(
-                    self._call_commenter_single,
-                    client,
-                    system_prompt,
-                    domain,
-                    topic,
-                    draft,
-                    ground_truth
-                )
-                for domain, topic, draft, ground_truth in pairs
-            ]
-            comments = [f.result() for f in futures]
+        with self._gpu_filler:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(
+                        self._call_commenter_single,
+                        client,
+                        system_prompt,
+                        domain,
+                        topic,
+                        draft,
+                        ground_truth
+                    )
+                    for domain, topic, draft, ground_truth in pairs
+                ]
+                comments = [f.result() for f in futures]
 
         return comments

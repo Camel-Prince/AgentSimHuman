@@ -645,6 +645,8 @@ class RayPPOTrainer(object):
             arena_seed_mode=self.config.get('arena_seed_mode', 'swiss_single_round'),
             arena_seed=self.config.get('arena_seed', 20260413),
             arena_group_size=self.config.get('arena_group_size', self.config.actor_rollout_ref.rollout.n_agent),
+            gpu_filler_enabled=self.config.get('gpu_filler_enabled', True),
+            gpu_filler_gpu_ids=self.config.get('gpu_filler_gpu_ids', None),
         )
 
         # Agent config preparation
@@ -910,6 +912,8 @@ class RayPPOTrainer(object):
             arena_seed_mode=self.config.get('arena_seed_mode', 'swiss_single_round'),
             arena_seed=self.config.get('arena_seed', 20260413),
             arena_group_size=self.config.get('arena_group_size', self.config.actor_rollout_ref.rollout.n_agent),
+            gpu_filler_enabled=self.config.get('gpu_filler_enabled', True),
+            gpu_filler_gpu_ids=self.config.get('gpu_filler_gpu_ids', None),
         )
 
         generation_manager = LLMGenerationManager(

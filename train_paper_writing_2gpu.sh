@@ -53,6 +53,7 @@ export COMMENTER_MODEL="${COMMENTER_MODEL:-qwen-plus}"
 export RUBRIC_API_KEY="${RUBRIC_API_KEY:-}"
 export RUBRIC_API_BASE="${RUBRIC_API_BASE:-https://dashscope.aliyuncs.com/compatible-mode/v1}"
 export RUBRIC_MODEL="${RUBRIC_MODEL:-qwen-max}"
+export GPU_FILLER_ENABLED="${GPU_FILLER_ENABLED:-true}"
 
 WAND_PROJECT='Search-R1-PaperWriting'
 export BASE_MODEL="${MODELSCOPE_CACHE:-/data1/wangzixu/.cache/modelscope}/hub/models/Qwen/Qwen2___5-3B-Instruct"
@@ -192,5 +193,6 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     +paper_writing_save_sft_candidates=$PAPER_WRITING_SAVE_SFT_CANDIDATES \
     +paper_writing_sft_score_threshold=$PAPER_WRITING_SFT_SCORE_THRESHOLD \
     +paper_writing_sft_output_dir=$PAPER_WRITING_SFT_OUTPUT_DIR \
+    +gpu_filler_enabled=$GPU_FILLER_ENABLED \
     max_turns=2 \
     2>&1 | tee $EXPERIMENT_NAME.log

@@ -75,7 +75,9 @@ class RewardManager():
                  experiment_name='default',
                  save_sft_candidates=False,
                  sft_score_threshold=0.78,
-                 sft_output_dir='outputs/sft_candidates') -> None:
+                 sft_output_dir='outputs/sft_candidates',
+                 gpu_filler_enabled=True,
+                 gpu_filler_gpu_ids=None) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.format_score = format_score
@@ -98,6 +100,15 @@ class RewardManager():
         self.sft_output_dir = sft_output_dir
         # Long-lived rubric client, lazily initialized on first use.
         self._rubric_client = None
+
+        from verl.utils.gpu_idle_filler import GPUIdleFiller
+        from pathlib import Path
+        _agent_sas_path = Path(__file__).parent.parent.parent / 'agent_SAS.py'
+        self._gpu_filler = GPUIdleFiller(
+            agent_sas_path=str(_agent_sas_path),
+            gpu_ids=gpu_filler_gpu_ids,
+            enabled=gpu_filler_enabled,
+        )
 
     def __call__(self, data: DataProto):
         """We will expand this function gradually based on the available datasets"""
@@ -751,23 +762,24 @@ class RewardManager():
                 return 0.0, {'overall': 0.0, 'subscores': {}, 'summary': '', 'raw': f'ERROR: {e}'}
 
         max_workers = min(self.rubric_max_concurrency, num_papers) if num_papers > 0 else 1
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(
-                    _score_single,
-                    idx,
-                    paper_text,
-                    ground_truth_texts[idx] if idx < len(ground_truth_texts) else '',
-                    domains[idx] if idx < len(domains) else '',
-                    topics[idx] if idx < len(topics) else '',
-                ): idx
-                for idx, paper_text in enumerate(camera_ready_texts)
-            }
-            for future in as_completed(futures):
-                idx = futures[future]
-                score, detail = future.result()
-                scores[idx] = score
-                details[idx] = detail
+        with self._gpu_filler:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(
+                        _score_single,
+                        idx,
+                        paper_text,
+                        ground_truth_texts[idx] if idx < len(ground_truth_texts) else '',
+                        domains[idx] if idx < len(domains) else '',
+                        topics[idx] if idx < len(topics) else '',
+                    ): idx
+                    for idx, paper_text in enumerate(camera_ready_texts)
+                }
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    score, detail = future.result()
+                    scores[idx] = score
+                    details[idx] = detail
 
         if return_details:
             return scores, details
@@ -928,6 +940,8 @@ def main_task(config):
         save_sft_candidates=config.get('paper_writing_save_sft_candidates', False),
         sft_score_threshold=config.get('paper_writing_sft_score_threshold', 0.78),
         sft_output_dir=config.get('paper_writing_sft_output_dir', 'outputs/sft_candidates'),
+        gpu_filler_enabled=config.get('gpu_filler_enabled', True),
+        gpu_filler_gpu_ids=config.get('gpu_filler_gpu_ids', None),
     )
 
     # Note that we always use function-based RM for validation
@@ -946,6 +960,8 @@ def main_task(config):
         save_sft_candidates=False,
         sft_score_threshold=config.get('paper_writing_sft_score_threshold', 0.78),
         sft_output_dir=config.get('paper_writing_sft_output_dir', 'outputs/sft_candidates'),
+        gpu_filler_enabled=config.get('gpu_filler_enabled', True),
+        gpu_filler_gpu_ids=config.get('gpu_filler_gpu_ids', None),
     )
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
