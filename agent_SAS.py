@@ -132,6 +132,11 @@ if __name__ == "__main__":
 
     print(f"[main] Launching workers on GPUs: {gpu_ids}")
 
+    # Use 'spawn' to avoid CUDA fork issues — the top-level `import torch`
+    # initializes CUDA, which is not fork-safe.  'spawn' ensures each worker
+    # gets a fresh CUDA context.
+    mp.set_start_method('spawn', force=True)
+
     processes = []
     for gid in gpu_ids:
         p = mp.Process(target=gpu_worker, args=(gid,))
